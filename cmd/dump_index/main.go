@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -34,14 +38,18 @@ func readIndexFromS3(bucket, key, region string) ([]byte, error) {
 	return ioutil.ReadAll(resp.Body)
 }
 
-func dumpIndex(data []byte) error {
+func dumpIndex(w io.Writer, data []byte) error {
 	idxr, err := index.NewReader(data)
 	if err != nil {
 		return err
 	}
 	defer idxr.Close()
 
-	fmt.Printf("Symbols: %d\n", idxr.SymbolTableSize())
+	// Collect all label names across the block and build a mapping
+	// of metric name to the set of labels that appear for that metric.
+	allLabels := map[string]struct{}{}
+	metricLabels := map[string]map[string]struct{}{}
+
 	it := idxr.Postings(index.AllPostingsKey())
 	for it.Next() {
 		id := it.At()
@@ -49,12 +57,75 @@ func dumpIndex(data []byte) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("series %d: %s\n", id, lset)
+
+		var metric string
+		for _, l := range lset {
+			allLabels[l.Name] = struct{}{}
+			if l.Name == "__name__" {
+				metric = l.Value
+			}
+		}
+
+		if metric == "" {
+			continue
+		}
+
+		ml, ok := metricLabels[metric]
+		if !ok {
+			ml = map[string]struct{}{}
+			metricLabels[metric] = ml
+		}
+		for _, l := range lset {
+			if l.Name == "__name__" {
+				continue
+			}
+			ml[l.Name] = struct{}{}
+		}
 	}
 	if it.Err() != nil {
 		return it.Err()
 	}
-	return nil
+
+	// Remove '__name__' from overall label list since it's used as metric
+	// name column in the CSV.
+	delete(allLabels, "__name__")
+
+	var labels []string
+	for l := range allLabels {
+		labels = append(labels, l)
+	}
+	sort.Strings(labels)
+
+	cw := csv.NewWriter(w)
+
+	header := append([]string{"metric_name"}, labels...)
+	if err := cw.Write(header); err != nil {
+		return err
+	}
+
+	var metrics []string
+	for m := range metricLabels {
+		metrics = append(metrics, m)
+	}
+	sort.Strings(metrics)
+
+	for _, m := range metrics {
+		row := make([]string, 0, len(labels)+1)
+		row = append(row, m)
+		ml := metricLabels[m]
+		for _, l := range labels {
+			if _, ok := ml[l]; ok {
+				row = append(row, "true")
+			} else {
+				row = append(row, "false")
+			}
+		}
+		if err := cw.Write(row); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
 }
 
 func main() {
@@ -83,7 +154,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := dumpIndex(data); err != nil {
+	if err := dumpIndex(os.Stdout, data); err != nil {
 		log.Fatal(err)
 	}
 }

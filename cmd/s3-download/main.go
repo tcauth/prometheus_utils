@@ -75,6 +75,8 @@ func testNetworkConnectivity(region string) error {
 	
 	return nil
 }
+
+func parseS3Path(s3Path string) (bucket, key string, err error) {
 	if !strings.HasPrefix(s3Path, "s3://") {
 		return "", "", fmt.Errorf("S3 path must start with s3://")
 	}

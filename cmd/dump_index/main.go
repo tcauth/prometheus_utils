@@ -11,6 +11,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -374,6 +375,9 @@ func dumpBlock(cfg Config) error {
 	// Build posting lists for efficient filtering
 	var postings index.Postings
 	
+	fmt.Fprintf(os.Stderr, "Building posting lists...\n")
+	startTime := time.Now()
+	
 	if cfg.MetricName != "" {
 		if cfg.Debug {
 			fmt.Fprintf(os.Stderr, "Getting postings for metric: %s\n", cfg.MetricName)
@@ -406,22 +410,70 @@ func dumpBlock(cfg Config) error {
 		postings = index.Intersect(postings, labelPostings)
 	}
 
+	fmt.Fprintf(os.Stderr, "Posting lists built in %v\n", time.Since(startTime))
+
+	// First pass: count total series to show progress
+	fmt.Fprintf(os.Stderr, "Counting matching series...\n")
+	countStartTime := time.Now()
+	
+	totalSeries := 0
+	countPostings := postings // We need to iterate through postings to count
+	for countPostings.Next() {
+		totalSeries++
+	}
+	if err := countPostings.Err(); err != nil {
+		return fmt.Errorf("error counting series: %w", err)
+	}
+	
+	fmt.Fprintf(os.Stderr, "Found %d matching series in %v\n", totalSeries, time.Since(countStartTime))
+	
+	// Reset postings for actual processing - we need to rebuild them
+	if cfg.MetricName != "" {
+		metricPostings, err := indexReader.Postings(labels.MetricName, cfg.MetricName)
+		if err != nil {
+			return fmt.Errorf("failed to get postings for metric %s: %w", cfg.MetricName, err)
+		}
+		postings = metricPostings
+	} else {
+		allPostings, err := indexReader.Postings(index.AllPostingsKey())
+		if err != nil {
+			return fmt.Errorf("failed to get all postings: %w", err)
+		}
+		postings = allPostings
+	}
+
+	if cfg.LabelKey != "" && cfg.LabelValue != "" {
+		labelPostings, err := indexReader.Postings(cfg.LabelKey, cfg.LabelValue)
+		if err != nil {
+			return fmt.Errorf("failed to get postings for label %s=%s: %w", cfg.LabelKey, cfg.LabelValue, err)
+		}
+		postings = index.Intersect(postings, labelPostings)
+	}
+
 	// Collect chunk information
 	var chunkInfos []ChunkInfo
 	var lbls labels.Labels
 	var chks []chunks.Meta
 	seriesCount := 0
-
-	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "Processing matching series...\n")
-	}
+	
+	fmt.Fprintf(os.Stderr, "Processing %d series...\n", totalSeries)
+	processingStartTime := time.Now()
+	lastProgressTime := time.Now()
 
 	for postings.Next() {
 		seriesID := postings.At()
 		seriesCount++
 		
-		if cfg.Debug && seriesCount%1000 == 0 {
-			fmt.Fprintf(os.Stderr, "Processed %d series...\n", seriesCount)
+		// Show progress every 1000 series or every 5 seconds
+		if seriesCount%1000 == 0 || time.Since(lastProgressTime) > 5*time.Second {
+			elapsed := time.Since(processingStartTime)
+			rate := float64(seriesCount) / elapsed.Seconds()
+			remaining := time.Duration(float64(totalSeries-seriesCount)/rate) * time.Second
+			progress := float64(seriesCount) / float64(totalSeries) * 100
+			
+			fmt.Fprintf(os.Stderr, "\rProgress: %d/%d series (%.1f%%) - Rate: %.0f series/sec - ETA: %v", 
+				seriesCount, totalSeries, progress, rate, remaining)
+			lastProgressTime = time.Now()
 		}
 		
 		// Get series labels and chunks - use ScratchBuilder for newer API
@@ -452,6 +504,10 @@ func dumpBlock(cfg Config) error {
 		}
 	}
 
+	// Clear the progress line and show final stats
+	fmt.Fprintf(os.Stderr, "\rCompleted processing %d series in %v                    \n", 
+		seriesCount, time.Since(processingStartTime))
+
 	if err := postings.Err(); err != nil {
 		return fmt.Errorf("postings iteration error: %w", err)
 	}
@@ -465,7 +521,10 @@ func dumpBlock(cfg Config) error {
 		fmt.Fprintf(os.Stderr, "- S3 range requests made: %d\n", ranges)
 		fmt.Fprintf(os.Stderr, "- Total bytes downloaded: %d (%.2f%% of index file)\n", 
 			bytes, float64(bytes)/float64(s3Reader.Size())*100)
+		fmt.Fprintf(os.Stderr, "- Processing time: %v\n", time.Since(processingStartTime))
 		fmt.Fprintf(os.Stderr, "\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Found %d chunks from %d series\n", len(chunkInfos), seriesCount)
 	}
 
 	// Output as CSV

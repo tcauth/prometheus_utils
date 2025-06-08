@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,6 +24,8 @@ type Config struct {
 	AWSProfile   string
 	AWSRegion    string
 	CheckRegion  bool
+	Parallel     bool
+	ChunkSize    int64
 }
 
 func main() {
@@ -33,6 +36,8 @@ func main() {
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name (optional)")
 	flag.StringVar(&cfg.AWSRegion, "aws-region", "", "AWS region (optional, will use profile default)")
 	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't download")
+	flag.BoolVar(&cfg.Parallel, "parallel", true, "Use parallel download for better performance (default: true)")
+	flag.Int64Var(&cfg.ChunkSize, "chunk-size", 10*1024*1024, "Chunk size for parallel downloads in bytes (default: 10MB)")
 	flag.Parse()
 
 	if cfg.S3Path == "" {
@@ -161,10 +166,14 @@ func downloadFile(cfg Config) error {
 		return fmt.Errorf("network connectivity test failed: %w", err)
 	}
 
-	// Create S3 client with explicit configuration
+	// Create S3 client with explicit configuration for better performance
 	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		// Force path-style addressing to avoid DNS issues with bucket names containing dots
 		o.UsePathStyle = true
+		// Enable dual-stack for better performance
+		o.UseDualStack = true
+		// Enable accelerated endpoint if available
+		o.UseAccelerate = true
 	})
 
 	// Test AWS credentials by getting caller identity (if available)
@@ -232,6 +241,8 @@ func downloadFile(cfg Config) error {
 			// Create new S3 client with correct region
 			s3Client = s3.NewFromConfig(newAwsCfg, func(o *s3.Options) {
 				o.UsePathStyle = true
+				o.UseDualStack = true
+				o.UseAccelerate = true
 			})
 			
 			// Retry HeadObject with correct region
@@ -267,27 +278,36 @@ func downloadFile(cfg Config) error {
 	fmt.Println("Downloading object...")
 	startTime := time.Now()
 
-	downloadCtx, downloadCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer downloadCancel()
+	var bytesWritten int64
+	var err error
 
-	getResp, err := s3Client.GetObject(downloadCtx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to download object: %w", err)
+	if cfg.Parallel && fileSize > cfg.ChunkSize {
+		fmt.Printf("Using parallel download with chunk size: %d MB\n", cfg.ChunkSize/(1024*1024))
+		bytesWritten, err = downloadParallel(s3Client, bucket, key, cfg.LocalPath, fileSize, cfg.ChunkSize)
+	} else {
+		fmt.Println("Using single-threaded download...")
+		downloadCtx, downloadCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer downloadCancel()
+
+		getResp, getErr := s3Client.GetObject(downloadCtx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if getErr != nil {
+			return fmt.Errorf("failed to download object: %w", getErr)
+		}
+		defer getResp.Body.Close()
+
+		// Create local file
+		localFile, createErr := os.Create(cfg.LocalPath)
+		if createErr != nil {
+			return fmt.Errorf("failed to create local file: %w", createErr)
+		}
+		defer localFile.Close()
+
+		// Copy data with progress tracking
+		bytesWritten, err = copyWithProgress(localFile, getResp.Body, fileSize)
 	}
-	defer getResp.Body.Close()
-
-	// Create local file
-	localFile, err := os.Create(cfg.LocalPath)
-	if err != nil {
-		return fmt.Errorf("failed to create local file: %w", err)
-	}
-	defer localFile.Close()
-
-	// Copy data with progress tracking
-	bytesWritten, err := copyWithProgress(localFile, getResp.Body, fileSize)
 	if err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
@@ -304,8 +324,112 @@ func downloadFile(cfg Config) error {
 	return nil
 }
 
+func downloadParallel(s3Client *s3.Client, bucket, key, localPath string, fileSize, chunkSize int64) (int64, error) {
+	// Calculate number of chunks
+	numChunks := (fileSize + chunkSize - 1) / chunkSize
+	fmt.Printf("Downloading in %d parallel chunks...\n", numChunks)
+
+	// Create the output file
+	file, err := os.Create(localPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	// Pre-allocate the file to avoid fragmentation
+	if err := file.Truncate(fileSize); err != nil {
+		return 0, fmt.Errorf("failed to allocate file space: %w", err)
+	}
+
+	// Progress tracking
+	var totalWritten int64
+	var mu sync.Mutex
+	progressTicker := time.NewTicker(2 * time.Second)
+	defer progressTicker.Stop()
+
+	go func() {
+		for range progressTicker.C {
+			mu.Lock()
+			written := totalWritten
+			mu.Unlock()
+			progress := float64(written) / float64(fileSize) * 100
+			fmt.Printf("\rProgress: %.1f%% (%d/%d bytes)", progress, written, fileSize)
+		}
+	}()
+
+	// Download chunks in parallel
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 10) // Limit to 10 concurrent downloads
+	errChan := make(chan error, numChunks)
+
+	for i := int64(0); i < numChunks; i++ {
+		wg.Add(1)
+		go func(chunkNum int64) {
+			defer wg.Done()
+			semaphore <- struct{}{} // Acquire
+			defer func() { <-semaphore }() // Release
+
+			start := chunkNum * chunkSize
+			end := start + chunkSize - 1
+			if end >= fileSize {
+				end = fileSize - 1
+			}
+
+			// Download this chunk
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+
+			rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
+			resp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+				Range:  aws.String(rangeHeader),
+			})
+			if err != nil {
+				errChan <- fmt.Errorf("failed to download chunk %d: %w", chunkNum, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Read the chunk data
+			chunkData, err := io.ReadAll(resp.Body)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to read chunk %d: %w", chunkNum, err)
+				return
+			}
+
+			// Write to the correct position in the file
+			_, err = file.WriteAt(chunkData, start)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to write chunk %d: %w", chunkNum, err)
+				return
+			}
+
+			// Update progress
+			mu.Lock()
+			totalWritten += int64(len(chunkData))
+			mu.Unlock()
+
+		}(i)
+	}
+
+	// Wait for all chunks to complete
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	for err := range errChan {
+		if err != nil {
+			return totalWritten, err
+		}
+	}
+
+	fmt.Printf("\rProgress: 100.0%% (%d/%d bytes)", totalWritten, fileSize)
+	return totalWritten, nil
+}
+
 func copyWithProgress(dst io.Writer, src io.Reader, totalSize int64) (int64, error) {
-	buf := make([]byte, 32*1024) // 32KB buffer
+	buf := make([]byte, 1024*1024) // 1MB buffer (much larger than 32KB)
 	var written int64
 	var lastPrint time.Time
 
@@ -327,10 +451,11 @@ func copyWithProgress(dst io.Writer, src io.Reader, totalSize int64) (int64, err
 				return written, io.ErrShortWrite
 			}
 
-			// Print progress every second
-			if time.Since(lastPrint) > time.Second {
+			// Print progress every 2 seconds (less frequent updates)
+			if time.Since(lastPrint) > 2*time.Second {
 				progress := float64(written) / float64(totalSize) * 100
-				fmt.Printf("\rProgress: %.1f%% (%d/%d bytes)", progress, written, totalSize)
+				speed := float64(written) / (1024 * 1024) / time.Since(time.Now().Add(-time.Duration(written*int64(time.Second))/1024/1024)).Seconds()
+				fmt.Printf("\rProgress: %.1f%% (%d/%d bytes) Speed: %.2f MB/s", progress, written, totalSize, speed)
 				lastPrint = time.Now()
 			}
 		}

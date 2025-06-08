@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -20,12 +21,10 @@ import (
 )
 
 type Config struct {
-	BlockID     string
+	BlockPath   string
 	MetricName  string
 	LabelKey    string
 	LabelValue  string
-	S3Bucket    string
-	S3Prefix    string
 	AWSRegion   string
 	AWSProfile  string
 	Debug       bool
@@ -44,6 +43,23 @@ type OptimizedS3Reader struct {
 	size      int64
 	cache     map[string][]byte // Cache for previously read ranges
 	debug     bool
+}
+
+func parseBlockPath(blockPath string) (bucket, tenant, blockID string, err error) {
+	if !strings.HasPrefix(blockPath, "s3://") {
+		return "", "", "", fmt.Errorf("block path must start with s3://")
+	}
+
+	// Remove s3:// prefix
+	path := strings.TrimPrefix(blockPath, "s3://")
+	
+	// Split into parts: bucket/tenant/block-id
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) < 3 {
+		return "", "", "", fmt.Errorf("block path must be in format s3://bucket/tenant/block-id")
+	}
+
+	return parts[0], parts[1], parts[2], nil
 }
 
 func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*OptimizedS3Reader, error) {
@@ -205,22 +221,17 @@ func (r *OptimizedS3Reader) GetStats() (int, int) {
 func main() {
 	var cfg Config
 	
-	flag.StringVar(&cfg.BlockID, "block", "", "Block ID to dump")
+	flag.StringVar(&cfg.BlockPath, "block", "", "Block path in format s3://bucket/tenant/block-id")
 	flag.StringVar(&cfg.MetricName, "metric-name", "", "Metric name to filter (optional)")
 	flag.StringVar(&cfg.LabelKey, "label-key", "", "Label key to filter (optional)")
 	flag.StringVar(&cfg.LabelValue, "label-value", "", "Label value to filter (optional)")
-	flag.StringVar(&cfg.S3Bucket, "s3-bucket", "", "S3 bucket name")
-	flag.StringVar(&cfg.S3Prefix, "s3-prefix", "", "S3 prefix/path to blocks")
 	flag.StringVar(&cfg.AWSRegion, "aws-region", "us-east-1", "AWS region")
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug output")
 	flag.Parse()
 
-	if cfg.BlockID == "" {
-		log.Fatal("Block ID is required")
-	}
-	if cfg.S3Bucket == "" {
-		log.Fatal("S3 bucket is required")
+	if cfg.BlockPath == "" {
+		log.Fatal("Block path is required (format: s3://bucket/tenant/block-id)")
 	}
 
 	if err := dumpBlock(cfg); err != nil {
@@ -229,6 +240,19 @@ func main() {
 }
 
 func dumpBlock(cfg Config) error {
+	// Parse the block path
+	bucket, tenant, blockID, err := parseBlockPath(cfg.BlockPath)
+	if err != nil {
+		return fmt.Errorf("invalid block path: %w", err)
+	}
+
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "Parsed block path:\n")
+		fmt.Fprintf(os.Stderr, "  Bucket: %s\n", bucket)
+		fmt.Fprintf(os.Stderr, "  Tenant: %s\n", tenant)
+		fmt.Fprintf(os.Stderr, "  Block ID: %s\n", blockID)
+	}
+
 	// Initialize AWS S3 client
 	var configOpts []func(*config.LoadOptions) error
 	configOpts = append(configOpts, config.WithRegion(cfg.AWSRegion))
@@ -250,15 +274,15 @@ func dumpBlock(cfg Config) error {
 		// o.UseAccelerate = true
 	})
 
-	// Construct S3 key for the index file
-	indexKey := path.Join(cfg.S3Prefix, cfg.BlockID, "index")
+	// Construct S3 key for the index file: tenant/block-id/index
+	indexKey := path.Join(tenant, blockID, "index")
 	
 	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "Reading index from s3://%s/%s\n", cfg.S3Bucket, indexKey)
+		fmt.Fprintf(os.Stderr, "Reading index from s3://%s/%s\n", bucket, indexKey)
 	}
 
 	// Create optimized S3 reader for the index file
-	s3Reader, err := NewOptimizedS3Reader(s3Client, cfg.S3Bucket, indexKey, cfg.Debug)
+	s3Reader, err := NewOptimizedS3Reader(s3Client, bucket, indexKey, cfg.Debug)
 	if err != nil {
 		return fmt.Errorf("failed to create S3 reader: %w", err)
 	}

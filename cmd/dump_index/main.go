@@ -34,6 +34,7 @@ type Config struct {
 	CheckRegion     bool
 	ForceIndexParallel bool
 	ChunkWorkers    int
+	ChunkTimeout    int
 	StartTime       int64
 	EndTime         int64
 	OutputFormat    string
@@ -428,6 +429,7 @@ func main() {
 	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't process")
 	flag.BoolVar(&cfg.ForceIndexParallel, "force-index-parallel", false, "Force parallel download for index file")
 	flag.IntVar(&cfg.ChunkWorkers, "chunk-workers", 20, "Number of parallel workers for chunk processing (default: 20)")
+	flag.IntVar(&cfg.ChunkTimeout, "chunk-timeout", 0, "Timeout per chunk in seconds (default: auto-calculated based on chunk size)")
 	flag.Int64Var(&cfg.StartTime, "start-time", 0, "Start time (Unix timestamp in milliseconds, optional)")
 	flag.Int64Var(&cfg.EndTime, "end-time", 0, "End time (Unix timestamp in milliseconds, optional)")
 	flag.StringVar(&cfg.OutputFormat, "output", "csv", "Output format: csv, json, or prometheus")
@@ -566,6 +568,11 @@ func dumpSeries(cfg Config) error {
 	if cfg.Debug {
 		fmt.Fprintf(os.Stderr, "Chunks file size: %d bytes (%.2f GB)\n", 
 			chunksReader.Size(), float64(chunksReader.Size())/(1024*1024*1024))
+		if cfg.ChunkTimeout > 0 {
+			fmt.Fprintf(os.Stderr, "Using fixed chunk timeout: %d seconds\n", cfg.ChunkTimeout)
+		} else {
+			fmt.Fprintf(os.Stderr, "Using adaptive chunk timeout: 30s base + 1s per KB chunk size (max 5min)\n")
+		}
 		fmt.Fprintf(os.Stderr, "Will process chunks using %d parallel workers with targeted range requests\n", cfg.ChunkWorkers)
 	}
 
@@ -748,14 +755,41 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 		return nil, fmt.Errorf("chunk has zero length")
 	}
 
-	// Create a fresh context for each chunk read with reasonable timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Calculate adaptive timeout based on chunk size and configuration
+	var timeout time.Duration
+	if cfg.ChunkTimeout > 0 {
+		// Use user-specified timeout
+		timeout = time.Duration(cfg.ChunkTimeout) * time.Second
+	} else {
+		// Auto-calculate timeout based on chunk size
+		// Base timeout: 30 seconds
+		// Additional time: 1 second per 1KB of chunk data
+		// Minimum: 30 seconds, Maximum: 5 minutes
+		baseTimeout := 30 * time.Second
+		sizeBasedTimeout := time.Duration(chunkLength/1024) * time.Second
+		timeout = baseTimeout + sizeBasedTimeout
+		
+		if timeout < 30*time.Second {
+			timeout = 30 * time.Second
+		}
+		if timeout > 5*time.Minute {
+			timeout = 5 * time.Minute
+		}
+	}
+
+	// Create a fresh context for each chunk read with calculated timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	
+	if cfg.Debug && job.Index%10000 == 0 {
+		fmt.Fprintf(os.Stderr, "\nWorker %d: Processing chunk %d (offset: %d, length: %d, timeout: %v)\n", 
+			workerID, job.Index+1, chunkOffset, chunkLength, timeout)
+	}
 	
 	chunkData := make([]byte, chunkLength)
 	n, err := chunksReader.ReadAtWithContext(ctx, chunkData, int64(chunkOffset))
 	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to read chunk data: %w", err)
+		return nil, fmt.Errorf("failed to read chunk data (timeout: %v): %w", timeout, err)
 	}
 
 	if n == 0 {
@@ -796,7 +830,7 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 	}
 
 	if cfg.Debug && len(points) > 0 && job.Index%10000 == 0 {
-		fmt.Fprintf(os.Stderr, "\nWorker %d: chunk %d (series: %s) extracted %d points\n", 
+		fmt.Fprintf(os.Stderr, "Worker %d: chunk %d (series: %s) extracted %d points\n", 
 			workerID, job.Index+1, labelsStr, len(points))
 	}
 

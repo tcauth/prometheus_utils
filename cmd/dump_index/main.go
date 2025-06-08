@@ -28,6 +28,7 @@ type Config struct {
 	AWSRegion   string
 	AWSProfile  string
 	Debug       bool
+	CheckRegion bool
 }
 
 type ChunkInfo struct {
@@ -43,6 +44,23 @@ type OptimizedS3Reader struct {
 	size      int64
 	cache     map[string][]byte // Cache for previously read ranges
 	debug     bool
+}
+
+func getBucketRegion(s3Client *s3.Client, bucket string, ctx context.Context) (string, error) {
+	// Try to get bucket location
+	locationResp, err := s3Client.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get bucket location: %w", err)
+	}
+	
+	// Handle the special case where us-east-1 returns empty
+	if locationResp.LocationConstraint == "" {
+		return "us-east-1", nil
+	}
+	
+	return string(locationResp.LocationConstraint), nil
 }
 
 func parseBlockPath(blockPath string) (bucket, tenant, blockID string, err error) {
@@ -228,6 +246,7 @@ func main() {
 	flag.StringVar(&cfg.AWSRegion, "aws-region", "us-east-1", "AWS region")
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug output")
+	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't process")
 	flag.Parse()
 
 	if cfg.BlockPath == "" {
@@ -284,7 +303,61 @@ func dumpBlock(cfg Config) error {
 	// Create optimized S3 reader for the index file
 	s3Reader, err := NewOptimizedS3Reader(s3Client, bucket, indexKey, cfg.Debug)
 	if err != nil {
-		return fmt.Errorf("failed to create S3 reader: %w", err)
+		// Check if it's a 301 redirect error (wrong region)
+		if strings.Contains(err.Error(), "301") {
+			fmt.Fprintf(os.Stderr, "Got 301 redirect - bucket might be in different region than %s\n", cfg.AWSRegion)
+			fmt.Fprintf(os.Stderr, "Attempting to get bucket location...\n")
+			
+			// Try to get the bucket's actual region
+			ctx := context.Background()
+			bucketRegion, regionErr := getBucketRegion(s3Client, bucket, ctx)
+			if regionErr != nil {
+				return fmt.Errorf("failed to get bucket region after 301 error: %w", regionErr)
+			}
+			
+			fmt.Fprintf(os.Stderr, "Bucket is actually in region: %s\n", bucketRegion)
+			fmt.Fprintf(os.Stderr, "Recreating S3 client for correct region...\n")
+			
+			// Create new config with correct region
+			newConfigOpts := []func(*config.LoadOptions) error{
+				config.WithRegion(bucketRegion),
+			}
+			if cfg.AWSProfile != "" {
+				newConfigOpts = append(newConfigOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
+			}
+			
+			newAwsCfg, err := config.LoadDefaultConfig(context.Background(), newConfigOpts...)
+			if err != nil {
+				return fmt.Errorf("failed to load AWS config for correct region: %w", err)
+			}
+			
+			// Create new S3 client with correct region
+			s3Client = s3.NewFromConfig(newAwsCfg, func(o *s3.Options) {
+				o.UsePathStyle = true
+			})
+			
+			// Retry creating S3 reader with correct region
+			s3Reader, err = NewOptimizedS3Reader(s3Client, bucket, indexKey, cfg.Debug)
+			if err != nil {
+				return fmt.Errorf("failed to create S3 reader even with correct region %s: %w", bucketRegion, err)
+			}
+			fmt.Fprintf(os.Stderr, "Successfully connected using region: %s\n", bucketRegion)
+		} else {
+			return fmt.Errorf("failed to create S3 reader: %w", err)
+		}
+	}
+
+	// If only checking region, do that and exit
+	if cfg.CheckRegion {
+		fmt.Fprintf(os.Stderr, "Checking bucket region...\n")
+		ctx := context.Background()
+		bucketRegion, err := getBucketRegion(s3Client, bucket, ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get bucket region: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Bucket '%s' is in region: %s\n", bucket, bucketRegion)
+		fmt.Fprintf(os.Stderr, "You should use: -aws-region %s\n", bucketRegion)
+		return nil
 	}
 
 	// Open index reader - use NewReader instead of NewFileReader for custom readers

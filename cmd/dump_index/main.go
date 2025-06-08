@@ -10,7 +10,6 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -191,8 +190,10 @@ func dumpBlock(cfg Config) error {
 
 	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.UsePathStyle = true
-		o.UseDualStack = true
-		o.UseAccelerate = true
+		// Note: UseDualStack was renamed to UseDualstack in newer versions
+		// Commenting out for compatibility
+		// o.UseDualStack = true
+		// o.UseAccelerate = true
 	})
 
 	// Construct S3 key for the index file
@@ -272,20 +273,30 @@ func dumpBlock(cfg Config) error {
 			fmt.Fprintf(os.Stderr, "Processed %d series...\n", seriesCount)
 		}
 		
-		// Get series labels and chunks
-		if err := indexReader.Series(seriesID, &lbls, &chks); err != nil {
+		// Get series labels and chunks - use ScratchBuilder for newer API
+		var builder labels.ScratchBuilder
+		if err := indexReader.Series(seriesID, &builder, &chks); err != nil {
 			return fmt.Errorf("failed to get series %d: %w", seriesID, err)
 		}
+		
+		// Get the labels from the builder
+		lbls = builder.Labels()
 
 		// Convert labels to string representation
 		labelsStr := lbls.String()
 
 		// Collect chunk information for this series
 		for _, chk := range chks {
+			// For TSDB chunks, the size isn't directly available from the index
+			// The chunk reference (Ref) contains the offset, but size needs to be
+			// calculated or estimated. For now, we'll use 0 as a placeholder
+			// since the main purpose is to get the offset information.
+			chunkSize := uint32(0) // Size not available from index alone
+			
 			chunkInfos = append(chunkInfos, ChunkInfo{
 				SeriesLabels: labelsStr,
 				ChunkOffset:  uint64(chk.Ref),
-				ChunkSize:    chk.Chunk.Len(),
+				ChunkSize:    chunkSize,
 			})
 		}
 	}

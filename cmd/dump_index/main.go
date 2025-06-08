@@ -139,6 +139,60 @@ func (r *OptimizedS3Reader) Size() int64 {
 	return r.size
 }
 
+// Implement index.ByteSlice interface
+func (r *OptimizedS3Reader) Len() int {
+	return int(r.size)
+}
+
+func (r *OptimizedS3Reader) Range(start, end int) []byte {
+	if start < 0 || end > int(r.size) || start >= end {
+		return nil
+	}
+	
+	data := make([]byte, end-start)
+	n, err := r.ReadAt(data, int64(start))
+	if err != nil && err != io.EOF {
+		return nil
+	}
+	
+	return data[:n]
+}
+
+func (r *OptimizedS3Reader) Sub(start, end int) index.ByteSlice {
+	// For simplicity, we'll return a new reader for the sub-range
+	// This is not the most efficient implementation but works for TSDB
+	if start < 0 || end > int(r.size) || start >= end {
+		return nil
+	}
+	
+	// Create a simple byte slice implementation
+	data := r.Range(start, end)
+	return &simpleByteSlice{data: data}
+}
+
+// Simple implementation of index.ByteSlice for sub-ranges
+type simpleByteSlice struct {
+	data []byte
+}
+
+func (s *simpleByteSlice) Len() int {
+	return len(s.data)
+}
+
+func (s *simpleByteSlice) Range(start, end int) []byte {
+	if start < 0 || end > len(s.data) || start >= end {
+		return nil
+	}
+	return s.data[start:end]
+}
+
+func (s *simpleByteSlice) Sub(start, end int) index.ByteSlice {
+	if start < 0 || end > len(s.data) || start >= end {
+		return nil
+	}
+	return &simpleByteSlice{data: s.data[start:end]}
+}
+
 func (r *OptimizedS3Reader) GetStats() (int, int) {
 	totalRanges := len(r.cache)
 	totalBytes := 0

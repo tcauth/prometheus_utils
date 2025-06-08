@@ -24,18 +24,19 @@ import (
 )
 
 type Config struct {
-	BlockPath     string
-	MetricName    string
-	LabelKey      string
-	LabelValue    string
-	AWSRegion     string
-	AWSProfile    string
-	Debug         bool
-	CheckRegion   bool
-	ForceParallel bool
-	StartTime     int64
-	EndTime       int64
-	OutputFormat  string
+	BlockPath       string
+	MetricName      string
+	LabelKey        string
+	LabelValue      string
+	AWSRegion       string
+	AWSProfile      string
+	Debug           bool
+	CheckRegion     bool
+	ForceIndexParallel bool
+	ChunkWorkers    int
+	StartTime       int64
+	EndTime         int64
+	OutputFormat    string
 	SwitchThreshold float64
 }
 
@@ -82,6 +83,13 @@ func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*O
 }
 
 func (r *OptimizedS3Reader) ReadAt(p []byte, off int64) (n int, err error) {
+	// Use a default context with reasonable timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return r.ReadAtWithContext(ctx, p, off)
+}
+
+func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off int64) (n int, err error) {
 	if off >= r.size {
 		return 0, io.EOF
 	}
@@ -140,10 +148,6 @@ func (r *OptimizedS3Reader) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", optimizedStart, optimizedEnd)
-	
-	// Use shorter timeout for range requests
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	
 	resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(r.bucket),
@@ -422,11 +426,12 @@ func main() {
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug output")
 	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't process")
-	flag.BoolVar(&cfg.ForceParallel, "force-parallel", false, "Force parallel download immediately (skip range requests)")
+	flag.BoolVar(&cfg.ForceIndexParallel, "force-index-parallel", false, "Force parallel download for index file")
+	flag.IntVar(&cfg.ChunkWorkers, "chunk-workers", 20, "Number of parallel workers for chunk processing (default: 20)")
 	flag.Int64Var(&cfg.StartTime, "start-time", 0, "Start time (Unix timestamp in milliseconds, optional)")
 	flag.Int64Var(&cfg.EndTime, "end-time", 0, "End time (Unix timestamp in milliseconds, optional)")
 	flag.StringVar(&cfg.OutputFormat, "output", "csv", "Output format: csv, json, or prometheus")
-	flag.Float64Var(&cfg.SwitchThreshold, "switch-threshold", 0.2, "Switch to full download when this fraction of file is requested (0.1-0.9, default: 0.2)")
+	flag.Float64Var(&cfg.SwitchThreshold, "switch-threshold", 0.2, "Switch to full download when this fraction of index file is requested (0.1-0.9, default: 0.2)")
 	flag.Parse()
 
 	if cfg.BlockPath == "" {
@@ -522,10 +527,10 @@ func dumpSeries(cfg Config) error {
 	// Set the switch threshold
 	indexReader.threshold = cfg.SwitchThreshold
 	
-	// Force parallel download if requested
-	if cfg.ForceParallel {
+	// Force parallel download for index if requested
+	if cfg.ForceIndexParallel {
 		if cfg.Debug {
-			fmt.Fprintf(os.Stderr, "Force parallel download requested, downloading index file...\n")
+			fmt.Fprintf(os.Stderr, "Force parallel download requested for index file...\n")
 		}
 		if err := indexReader.downloadParallel(50 * 1024 * 1024); err != nil {
 			return fmt.Errorf("failed to force download index file: %w", err)
@@ -547,11 +552,21 @@ func dumpSeries(cfg Config) error {
 
 	fmt.Fprintf(os.Stderr, "Found %d chunks for %d series\n", len(chunkRefs), len(seriesLabels))
 
-	// Read chunks file to get actual data
+	// Read chunks file to get actual data (DON'T download the entire file)
 	chunksKey := path.Join(tenant, blockID, "chunks", "000001")
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "Setting up chunks reader for s3://%s/%s\n", bucket, chunksKey)
+	}
+	
 	chunksReader, err := NewOptimizedS3Reader(s3Client, bucket, chunksKey, cfg.Debug)
 	if err != nil {
 		return fmt.Errorf("failed to create chunks reader: %w", err)
+	}
+
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "Chunks file size: %d bytes (%.2f GB)\n", 
+			chunksReader.Size(), float64(chunksReader.Size())/(1024*1024*1024))
+		fmt.Fprintf(os.Stderr, "Will process chunks using %d parallel workers with targeted range requests\n", cfg.ChunkWorkers)
 	}
 
 	fmt.Fprintf(os.Stderr, "Reading time series data from chunks...\n")
@@ -622,71 +637,167 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]chunks.Meta, []labels.L
 	return allChunks, allLabels, postings.Err()
 }
 
+type ChunkJob struct {
+	Index       int
+	ChunkRef    chunks.Meta
+	SeriesLabel labels.Labels
+}
+
+type ChunkResult struct {
+	Points   []SeriesPoint
+	Error    error
+	Index    int
+	ChunkRef chunks.Meta
+}
+
 func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, seriesLabels []labels.Labels, cfg Config) ([]SeriesPoint, error) {
+	var allPoints []SeriesPoint
+	startTime := time.Now()
+
+	fmt.Fprintf(os.Stderr, "Processing %d chunks using %d parallel workers...\n", len(chunkRefs), cfg.ChunkWorkers)
+
+	// Create job and result channels
+	jobs := make(chan ChunkJob, len(chunkRefs))
+	results := make(chan ChunkResult, len(chunkRefs))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for w := 0; w < cfg.ChunkWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			processChunks(workerID, jobs, results, chunksReader, cfg)
+		}(w)
+	}
+
+	// Send jobs to workers
+	go func() {
+		for i, chkMeta := range chunkRefs {
+			jobs <- ChunkJob{
+				Index:       i,
+				ChunkRef:    chkMeta,
+				SeriesLabel: seriesLabels[i],
+			}
+		}
+		close(jobs)
+	}()
+
+	// Progress tracking
+	processed := 0
+	lastProgressTime := time.Now()
+	totalPoints := 0
+
+	// Collect results
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		processed++
+		
+		if result.Error != nil {
+			chunkOffset := uint64(result.ChunkRef.Ref) >> 32
+			chunkLength := uint32(result.ChunkRef.Ref)
+			fmt.Fprintf(os.Stderr, "\nWarning: chunk %d/%d (offset: %d, length: %d) failed: %v\n", 
+				result.Index+1, len(chunkRefs), chunkOffset, chunkLength, result.Error)
+		} else {
+			allPoints = append(allPoints, result.Points...)
+			totalPoints += len(result.Points)
+		}
+
+		// Show progress every 1000 chunks or every 10 seconds
+		if processed%1000 == 0 || time.Since(lastProgressTime) > 10*time.Second {
+			elapsed := time.Since(startTime)
+			rate := float64(processed) / elapsed.Seconds()
+			remaining := time.Duration(float64(len(chunkRefs)-processed)/rate) * time.Second
+			progress := float64(processed) / float64(len(chunkRefs)) * 100
+			
+			fmt.Fprintf(os.Stderr, "\rChunk progress: %d/%d (%.1f%%) - Rate: %.0f chunks/sec - ETA: %v - Points: %d", 
+				processed, len(chunkRefs), progress, rate, remaining, totalPoints)
+			lastProgressTime = time.Now()
+		}
+	}
+
+	// Clear progress line and show final stats
+	elapsed := time.Since(startTime)
+	fmt.Fprintf(os.Stderr, "\rCompleted processing %d chunks in %v using %d workers - Extracted %d data points                    \n", 
+		len(chunkRefs), elapsed, cfg.ChunkWorkers, len(allPoints))
+
+	return allPoints, nil
+}
+
+func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResult, chunksReader *OptimizedS3Reader, cfg Config) {
+	for job := range jobs {
+		points, err := processOneChunk(job, chunksReader, cfg, workerID)
+		results <- ChunkResult{
+			Points:   points,
+			Error:    err,
+			Index:    job.Index,
+			ChunkRef: job.ChunkRef,
+		}
+	}
+}
+
+func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, workerID int) ([]SeriesPoint, error) {
+	// Read chunk data using the reference offset
+	chunkOffset := uint64(job.ChunkRef.Ref) >> 32 // Higher 32 bits are offset
+	chunkLength := uint32(job.ChunkRef.Ref)       // Lower 32 bits are length
+
+	if chunkLength == 0 {
+		return nil, fmt.Errorf("chunk has zero length")
+	}
+
+	// Create a fresh context for each chunk read with reasonable timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	chunkData := make([]byte, chunkLength)
+	n, err := chunksReader.ReadAtWithContext(ctx, chunkData, int64(chunkOffset))
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read chunk data: %w", err)
+	}
+
+	if n == 0 {
+		return nil, fmt.Errorf("read 0 bytes from chunk")
+	}
+
+	// Decode chunk
+	chunk, err := chunkenc.FromData(chunkenc.EncXOR, chunkData[:n])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode chunk: %w", err)
+	}
+
+	// Extract time series points
+	iter := chunk.Iterator(nil)
+	labelsStr := job.SeriesLabel.String()
 	var points []SeriesPoint
 
-	for i, chkMeta := range chunkRefs {
-		if cfg.Debug && i%1000 == 0 {
-			fmt.Fprintf(os.Stderr, "Processing chunk %d/%d...\n", i+1, len(chunkRefs))
+	for iter.Next() == chunkenc.ValFloat {
+		ts, val := iter.At()
+		
+		// Apply time range filter
+		if cfg.StartTime > 0 && ts < cfg.StartTime {
+			continue
 		}
-
-		// Read chunk data using the reference offset
-		chunkOffset := uint64(chkMeta.Ref) >> 32 // Higher 32 bits are offset
-		chunkLength := uint32(chkMeta.Ref)       // Lower 32 bits are length
-
-		if chunkLength == 0 {
-			continue // Skip if we can't determine chunk size
-		}
-
-		chunkData := make([]byte, chunkLength)
-		n, err := chunksReader.ReadAt(chunkData, int64(chunkOffset))
-		if err != nil && err != io.EOF {
-			if cfg.Debug {
-				fmt.Fprintf(os.Stderr, "Warning: failed to read chunk at offset %d: %v\n", chunkOffset, err)
-			}
+		if cfg.EndTime > 0 && ts > cfg.EndTime {
 			continue
 		}
 
-		if n == 0 {
-			continue
-		}
+		points = append(points, SeriesPoint{
+			SeriesLabels: labelsStr,
+			Timestamp:    ts,
+			Value:        val,
+		})
+	}
 
-		// Decode chunk
-		chunk, err := chunkenc.FromData(chunkenc.EncXOR, chunkData[:n])
-		if err != nil {
-			if cfg.Debug {
-				fmt.Fprintf(os.Stderr, "Warning: failed to decode chunk: %v\n", err)
-			}
-			continue
-		}
+	if err := iter.Err(); err != nil {
+		return points, fmt.Errorf("iterator error: %w", err)
+	}
 
-		// Extract time series points
-		iter := chunk.Iterator(nil)
-		labelsStr := seriesLabels[i].String()
-
-		for iter.Next() == chunkenc.ValFloat {
-			ts, val := iter.At()
-			
-			// Apply time range filter
-			if cfg.StartTime > 0 && ts < cfg.StartTime {
-				continue
-			}
-			if cfg.EndTime > 0 && ts > cfg.EndTime {
-				continue
-			}
-
-			points = append(points, SeriesPoint{
-				SeriesLabels: labelsStr,
-				Timestamp:    ts,
-				Value:        val,
-			})
-		}
-
-		if err := iter.Err(); err != nil {
-			if cfg.Debug {
-				fmt.Fprintf(os.Stderr, "Warning: iterator error: %v\n", err)
-			}
-		}
+	if cfg.Debug && len(points) > 0 && job.Index%10000 == 0 {
+		fmt.Fprintf(os.Stderr, "\nWorker %d: chunk %d (series: %s) extracted %d points\n", 
+			workerID, job.Index+1, labelsStr, len(points))
 	}
 
 	return points, nil

@@ -11,6 +11,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,6 +31,7 @@ type Config struct {
 	AWSProfile  string
 	Debug       bool
 	CheckRegion bool
+	ForceParallel bool
 }
 
 type ChunkInfo struct {
@@ -39,12 +41,15 @@ type ChunkInfo struct {
 }
 
 type OptimizedS3Reader struct {
-	client    *s3.Client
-	bucket    string
-	key       string
-	size      int64
-	cache     map[string][]byte // Cache for previously read ranges
-	debug     bool
+	client      *s3.Client
+	bucket      string
+	key         string
+	size        int64
+	cache       map[string][]byte // Cache for previously read ranges
+	debug       bool
+	data        []byte            // Full data for parallel-downloaded index
+	useFullData bool              // Whether to use full data instead of range requests
+	mu          sync.RWMutex      // Protect cache access
 }
 
 func getBucketRegion(s3Client *s3.Client, bucket string, ctx context.Context) (string, error) {
@@ -92,13 +97,170 @@ func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*O
 	}
 
 	return &OptimizedS3Reader{
-		client: client,
-		bucket: bucket,
-		key:    key,
-		size:   *headResp.ContentLength,
-		cache:  make(map[string][]byte),
-		debug:  debug,
+		client:      client,
+		bucket:      bucket,
+		key:         key,
+		size:        *headResp.ContentLength,
+		cache:       make(map[string][]byte),
+		debug:       debug,
+		useFullData: false,
 	}, nil
+}
+
+// PreloadFull downloads the entire index file using parallel downloads for performance
+func (r *OptimizedS3Reader) PreloadFull() error {
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "Preloading entire index file (%d bytes) using parallel download...\n", r.size)
+	}
+
+	chunkSize := int64(10 * 1024 * 1024) // 10MB chunks
+	if r.size < chunkSize {
+		// For small files, just download in one piece
+		return r.downloadSingle()
+	}
+
+	return r.downloadParallel(chunkSize)
+}
+
+func (r *OptimizedS3Reader) downloadSingle() error {
+	startTime := time.Now()
+	
+	resp, err := r.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(r.key),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to download object: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	r.data = data
+	r.useFullData = true
+	
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "Downloaded %d bytes in %v\n", len(data), time.Since(startTime))
+	}
+	
+	return nil
+}
+
+func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
+	numChunks := (r.size + chunkSize - 1) / chunkSize
+	
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "Downloading in %d parallel chunks of %d MB each...\n", 
+			numChunks, chunkSize/(1024*1024))
+	}
+
+	// Pre-allocate the data slice
+	r.data = make([]byte, r.size)
+	
+	startTime := time.Now()
+	
+	// Progress tracking
+	var totalWritten int64
+	var mu sync.Mutex
+	progressTicker := time.NewTicker(2 * time.Second)
+	defer progressTicker.Stop()
+
+	// Progress reporting goroutine
+	done := make(chan bool)
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-progressTicker.C:
+				mu.Lock()
+				written := totalWritten
+				mu.Unlock()
+				progress := float64(written) / float64(r.size) * 100
+				elapsed := time.Since(startTime)
+				rate := float64(written) / (1024 * 1024) / elapsed.Seconds()
+				fmt.Fprintf(os.Stderr, "\rDownload progress: %.1f%% (%d/%d bytes) - %.2f MB/s", 
+					progress, written, r.size, rate)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Download chunks in parallel
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 10) // Limit to 10 concurrent downloads
+	errChan := make(chan error, numChunks)
+
+	for i := int64(0); i < numChunks; i++ {
+		wg.Add(1)
+		go func(chunkNum int64) {
+			defer wg.Done()
+			semaphore <- struct{}{} // Acquire
+			defer func() { <-semaphore }() // Release
+
+			start := chunkNum * chunkSize
+			end := start + chunkSize - 1
+			if end >= r.size {
+				end = r.size - 1
+			}
+
+			// Download this chunk
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+
+			rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
+			resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(r.bucket),
+				Key:    aws.String(r.key),
+				Range:  aws.String(rangeHeader),
+			})
+			if err != nil {
+				errChan <- fmt.Errorf("failed to download chunk %d: %w", chunkNum, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Read the chunk data
+			chunkData, err := io.ReadAll(resp.Body)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to read chunk %d: %w", chunkNum, err)
+				return
+			}
+
+			// Write to the correct position in the data slice
+			copy(r.data[start:start+int64(len(chunkData))], chunkData)
+
+			// Update progress
+			mu.Lock()
+			totalWritten += int64(len(chunkData))
+			mu.Unlock()
+
+		}(i)
+	}
+
+	// Wait for all chunks to complete
+	wg.Wait()
+	done <- true // Stop progress reporting
+	close(errChan)
+
+	// Check for errors
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	r.useFullData = true
+	
+	elapsed := time.Since(startTime)
+	rate := float64(r.size) / (1024 * 1024) / elapsed.Seconds()
+	fmt.Fprintf(os.Stderr, "\rDownload completed: %d bytes in %v (%.2f MB/s)          \n", 
+		r.size, elapsed, rate)
+	
+	return nil
 }
 
 func (r *OptimizedS3Reader) ReadAt(p []byte, off int64) (n int, err error) {
@@ -184,6 +346,11 @@ func (r *OptimizedS3Reader) Range(start, end int) []byte {
 		return nil
 	}
 	
+	// If we have full data preloaded, use it directly
+	if r.useFullData {
+		return r.data[start:end]
+	}
+	
 	data := make([]byte, end-start)
 	n, err := r.ReadAt(data, int64(start))
 	if err != nil && err != io.EOF {
@@ -229,6 +396,13 @@ func (s *simpleByteSlice) Sub(start, end int) index.ByteSlice {
 }
 
 func (r *OptimizedS3Reader) GetStats() (int, int) {
+	if r.useFullData {
+		return 1, len(r.data) // One "request" for the full data
+	}
+	
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	
 	totalRanges := len(r.cache)
 	totalBytes := 0
 	for _, data := range r.cache {
@@ -248,6 +422,7 @@ func main() {
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug output")
 	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't process")
+	flag.BoolVar(&cfg.ForceParallel, "force-parallel", false, "Force parallel download even for targeted queries")
 	flag.Parse()
 
 	if cfg.BlockPath == "" {
@@ -369,7 +544,25 @@ func dumpBlock(cfg Config) error {
 	defer indexReader.Close()
 
 	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "Index file size: %d bytes\n", s3Reader.Size())
+		fmt.Fprintf(os.Stderr, "Index file size: %d bytes (%.2f MB)\n", s3Reader.Size(), float64(s3Reader.Size())/(1024*1024))
+	}
+
+	// Determine if we should use parallel download
+	// Use parallel download if:
+	// 1. No specific metric filter (scanning entire index)
+	// 2. Index file is large (>50MB)
+	// 3. Force parallel is enabled
+	shouldUseParallel := cfg.ForceParallel || 
+		(cfg.MetricName == "" && s3Reader.Size() > 50*1024*1024) ||
+		s3Reader.Size() > 200*1024*1024 // Always parallel for very large files
+
+	if shouldUseParallel {
+		fmt.Fprintf(os.Stderr, "Using parallel download strategy for large index file...\n")
+		if err := s3Reader.PreloadFull(); err != nil {
+			return fmt.Errorf("failed to preload index file: %w", err)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Using targeted range request strategy...\n")
 	}
 
 	// Build posting lists for efficient filtering

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,36 @@ func main() {
 	}
 }
 
-func parseS3Path(s3Path string) (bucket, key string, err error) {
+func testNetworkConnectivity(region string) error {
+	// Test DNS resolution for S3 endpoint
+	s3Endpoint := fmt.Sprintf("s3.%s.amazonaws.com", region)
+	fmt.Printf("Testing DNS resolution for: %s\n", s3Endpoint)
+	
+	ips, err := net.LookupIP(s3Endpoint)
+	if err != nil {
+		return fmt.Errorf("DNS lookup failed for %s: %w", s3Endpoint, err)
+	}
+	
+	fmt.Printf("DNS resolution successful. IPs: ")
+	for i, ip := range ips {
+		if i > 0 {
+			fmt.Print(", ")
+		}
+		fmt.Print(ip.String())
+	}
+	fmt.Println()
+	
+	// Test basic TCP connectivity
+	fmt.Printf("Testing TCP connectivity to %s:443...\n", s3Endpoint)
+	conn, err := net.DialTimeout("tcp", s3Endpoint+":443", 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("TCP connection failed: %w", err)
+	}
+	conn.Close()
+	fmt.Println("TCP connectivity test successful!")
+	
+	return nil
+}
 	if !strings.HasPrefix(s3Path, "s3://") {
 		return "", "", fmt.Errorf("S3 path must start with s3://")
 	}
@@ -79,13 +109,18 @@ func downloadFile(cfg Config) error {
 		configOpts = append(configOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
 	}
 
-	// Add region if specified
+	// Add region if specified - if not specified, try to use a default
 	if cfg.AWSRegion != "" {
 		fmt.Printf("Using AWS region: %s\n", cfg.AWSRegion)
 		configOpts = append(configOpts, config.WithRegion(cfg.AWSRegion))
+	} else {
+		// Set a default region if none is specified
+		fmt.Println("No region specified, using default: us-east-1")
+		configOpts = append(configOpts, config.WithRegion("us-east-1"))
 	}
 
 	// Load AWS configuration
+	fmt.Println("Loading AWS configuration...")
 	awsCfg, err := config.LoadDefaultConfig(context.Background(), configOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
@@ -93,16 +128,43 @@ func downloadFile(cfg Config) error {
 
 	// Display the region being used
 	fmt.Printf("AWS Region: %s\n", awsCfg.Region)
+	
+	// Validate the region is not empty
+	if awsCfg.Region == "" {
+		return fmt.Errorf("AWS region is empty - please specify -aws-region or configure it in your AWS profile")
+	}
 
-	// Create S3 client
-	s3Client := s3.NewFromConfig(awsCfg)
+	// Test network connectivity first
+	fmt.Println("Testing network connectivity...")
+	if err := testNetworkConnectivity(awsCfg.Region); err != nil {
+		return fmt.Errorf("network connectivity test failed: %w", err)
+	}
+
+	// Create S3 client with explicit configuration
+	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		// Force path-style addressing to avoid DNS issues with bucket names containing dots
+		o.UsePathStyle = true
+	})
 
 	// Test AWS credentials by getting caller identity (if available)
 	fmt.Println("Testing AWS credentials...")
 
+	// Try to list buckets first as a basic connectivity test
+	fmt.Println("Testing S3 connectivity...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	_, err = s3Client.ListBuckets(ctx, &s3.ListBucketsInput{})
+	if err != nil {
+		fmt.Printf("Warning: Failed to list buckets (this might be due to permissions): %v\n", err)
+		fmt.Println("Continuing with object download attempt...")
+	} else {
+		fmt.Println("S3 connectivity test successful!")
+	}
+
 	// Get object metadata first
 	fmt.Println("Getting object metadata...")
-	headResp, err := s3Client.HeadObject(context.Background(), &s3.HeadObjectInput{
+	headResp, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -129,7 +191,10 @@ func downloadFile(cfg Config) error {
 	fmt.Println("Downloading object...")
 	startTime := time.Now()
 
-	getResp, err := s3Client.GetObject(context.Background(), &s3.GetObjectInput{
+	downloadCtx, downloadCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer downloadCancel()
+
+	getResp, err := s3Client.GetObject(downloadCtx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})

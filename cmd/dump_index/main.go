@@ -209,8 +209,8 @@ func dumpBlock(cfg Config) error {
 		return fmt.Errorf("failed to create S3 reader: %w", err)
 	}
 
-	// Open index reader
-	indexReader, err := index.NewFileReader(s3Reader)
+	// Open index reader - use NewReader instead of NewFileReader for custom readers
+	indexReader, err := index.NewReader(s3Reader)
 	if err != nil {
 		return fmt.Errorf("failed to open index reader: %w", err)
 	}

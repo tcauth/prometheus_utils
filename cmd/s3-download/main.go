@@ -18,10 +18,11 @@ import (
 )
 
 type Config struct {
-	S3Path     string
-	LocalPath  string
-	AWSProfile string
-	AWSRegion  string
+	S3Path       string
+	LocalPath    string
+	AWSProfile   string
+	AWSRegion    string
+	CheckRegion  bool
 }
 
 func main() {
@@ -31,13 +32,14 @@ func main() {
 	flag.StringVar(&cfg.LocalPath, "local-path", "", "Local file path to save the downloaded file")
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name (optional)")
 	flag.StringVar(&cfg.AWSRegion, "aws-region", "", "AWS region (optional, will use profile default)")
+	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't download")
 	flag.Parse()
 
 	if cfg.S3Path == "" {
 		log.Fatal("S3 path is required (format: s3://bucket/key)")
 	}
-	if cfg.LocalPath == "" {
-		log.Fatal("Local path is required")
+	if cfg.LocalPath == "" && !cfg.CheckRegion {
+		log.Fatal("Local path is required (unless using -check-region)")
 	}
 
 	if err := downloadFile(cfg); err != nil {
@@ -74,6 +76,23 @@ func testNetworkConnectivity(region string) error {
 	fmt.Println("TCP connectivity test successful!")
 	
 	return nil
+}
+
+func getBucketRegion(s3Client *s3.Client, bucket string, ctx context.Context) (string, error) {
+	// Try to get bucket location
+	locationResp, err := s3Client.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get bucket location: %w", err)
+	}
+	
+	// Handle the special case where us-east-1 returns empty
+	if locationResp.LocationConstraint == "" {
+		return "us-east-1", nil
+	}
+	
+	return string(locationResp.LocationConstraint), nil
 }
 
 func parseS3Path(s3Path string) (bucket, key string, err error) {
@@ -164,6 +183,18 @@ func downloadFile(cfg Config) error {
 		fmt.Println("S3 connectivity test successful!")
 	}
 
+	// If only checking region, do that and exit
+	if cfg.CheckRegion {
+		fmt.Println("Checking bucket region...")
+		bucketRegion, err := getBucketRegion(s3Client, bucket, ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get bucket region: %w", err)
+		}
+		fmt.Printf("Bucket '%s' is in region: %s\n", bucket, bucketRegion)
+		fmt.Printf("You should use: -aws-region %s\n", bucketRegion)
+		return nil
+	}
+
 	// Get object metadata first
 	fmt.Println("Getting object metadata...")
 	headResp, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -171,7 +202,50 @@ func downloadFile(cfg Config) error {
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to get object metadata: %w", err)
+		// Check if it's a 301 redirect error (wrong region)
+		if strings.Contains(err.Error(), "301") {
+			fmt.Printf("Got 301 redirect - bucket might be in different region than %s\n", awsCfg.Region)
+			fmt.Println("Attempting to get bucket location...")
+			
+			// Try to get the bucket's actual region
+			bucketRegion, regionErr := getBucketRegion(s3Client, bucket, ctx)
+			if regionErr != nil {
+				return fmt.Errorf("failed to get bucket region after 301 error: %w", regionErr)
+			}
+			
+			fmt.Printf("Bucket is actually in region: %s\n", bucketRegion)
+			fmt.Printf("Recreating S3 client for correct region...\n")
+			
+			// Create new config with correct region
+			newConfigOpts := []func(*config.LoadOptions) error{
+				config.WithRegion(bucketRegion),
+			}
+			if cfg.AWSProfile != "" {
+				newConfigOpts = append(newConfigOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
+			}
+			
+			newAwsCfg, err := config.LoadDefaultConfig(context.Background(), newConfigOpts...)
+			if err != nil {
+				return fmt.Errorf("failed to load AWS config for correct region: %w", err)
+			}
+			
+			// Create new S3 client with correct region
+			s3Client = s3.NewFromConfig(newAwsCfg, func(o *s3.Options) {
+				o.UsePathStyle = true
+			})
+			
+			// Retry HeadObject with correct region
+			headResp, err = s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to get object metadata even with correct region %s: %w", bucketRegion, err)
+			}
+			fmt.Printf("Successfully connected using region: %s\n", bucketRegion)
+		} else {
+			return fmt.Errorf("failed to get object metadata: %w", err)
+		}
 	}
 
 	fileSize := *headResp.ContentLength

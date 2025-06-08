@@ -28,6 +28,8 @@ type Config struct {
 	S3Bucket    string
 	S3Prefix    string
 	AWSRegion   string
+	AWSProfile  string
+	Debug       bool
 }
 
 type ChunkInfo struct {
@@ -36,14 +38,16 @@ type ChunkInfo struct {
 	ChunkSize    uint32
 }
 
-type S3Reader struct {
-	client *s3.Client
-	bucket string
-	key    string
-	size   int64
+type OptimizedS3Reader struct {
+	client    *s3.Client
+	bucket    string
+	key       string
+	size      int64
+	cache     map[string][]byte // Cache for previously read ranges
+	debug     bool
 }
 
-func NewS3Reader(client *s3.Client, bucket, key string) (*S3Reader, error) {
+func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*OptimizedS3Reader, error) {
 	// Get object size
 	headResp, err := client.HeadObject(context.Background(), &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
@@ -53,15 +57,17 @@ func NewS3Reader(client *s3.Client, bucket, key string) (*S3Reader, error) {
 		return nil, fmt.Errorf("failed to get object info: %w", err)
 	}
 
-	return &S3Reader{
+	return &OptimizedS3Reader{
 		client: client,
 		bucket: bucket,
 		key:    key,
 		size:   *headResp.ContentLength,
+		cache:  make(map[string][]byte),
+		debug:  debug,
 	}, nil
 }
 
-func (r *S3Reader) ReadAt(p []byte, off int64) (n int, err error) {
+func (r *OptimizedS3Reader) ReadAt(p []byte, off int64) (n int, err error) {
 	if off >= r.size {
 		return 0, io.EOF
 	}
@@ -71,7 +77,32 @@ func (r *S3Reader) ReadAt(p []byte, off int64) (n int, err error) {
 		end = r.size - 1
 	}
 
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", off, end)
+	// Create cache key for this range
+	cacheKey := fmt.Sprintf("%d-%d", off, end)
+	
+	// Check cache first
+	if data, exists := r.cache[cacheKey]; exists {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Cache hit for range %s (%d bytes)\n", cacheKey, len(data))
+		}
+		copy(p, data)
+		return len(data), nil
+	}
+
+	// Optimize range size - read in larger chunks to reduce S3 requests
+	// Round down to 64KB boundary for start, round up for end
+	optimizedStart := (off / 65536) * 65536
+	optimizedEnd := ((end / 65536) + 1) * 65536 - 1
+	if optimizedEnd >= r.size {
+		optimizedEnd = r.size - 1
+	}
+
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", optimizedStart, optimizedEnd)
+	
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "S3 request: %s (requested: %d-%d, optimized: %d-%d)\n", 
+			rangeHeader, off, end, optimizedStart, optimizedEnd)
+	}
 	
 	resp, err := r.client.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(r.bucket),
@@ -83,11 +114,39 @@ func (r *S3Reader) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 	defer resp.Body.Close()
 
-	return io.ReadFull(resp.Body, p)
+	// Read the entire optimized range
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Cache the optimized range
+	optimizedCacheKey := fmt.Sprintf("%d-%d", optimizedStart, optimizedEnd)
+	r.cache[optimizedCacheKey] = data
+
+	// Extract the requested portion
+	requestedOffset := off - optimizedStart
+	requestedLength := end - off + 1
+	
+	if requestedOffset+requestedLength > int64(len(data)) {
+		requestedLength = int64(len(data)) - requestedOffset
+	}
+
+	copy(p, data[requestedOffset:requestedOffset+requestedLength])
+	return int(requestedLength), nil
 }
 
-func (r *S3Reader) Size() int64 {
+func (r *OptimizedS3Reader) Size() int64 {
 	return r.size
+}
+
+func (r *OptimizedS3Reader) GetStats() (int, int) {
+	totalRanges := len(r.cache)
+	totalBytes := 0
+	for _, data := range r.cache {
+		totalBytes += len(data)
+	}
+	return totalRanges, totalBytes
 }
 
 func main() {
@@ -100,6 +159,8 @@ func main() {
 	flag.StringVar(&cfg.S3Bucket, "s3-bucket", "", "S3 bucket name")
 	flag.StringVar(&cfg.S3Prefix, "s3-prefix", "", "S3 prefix/path to blocks")
 	flag.StringVar(&cfg.AWSRegion, "aws-region", "us-east-1", "AWS region")
+	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name")
+	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug output")
 	flag.Parse()
 
 	if cfg.BlockID == "" {
@@ -116,20 +177,33 @@ func main() {
 
 func dumpBlock(cfg Config) error {
 	// Initialize AWS S3 client
-	awsCfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion(cfg.AWSRegion),
-	)
+	var configOpts []func(*config.LoadOptions) error
+	configOpts = append(configOpts, config.WithRegion(cfg.AWSRegion))
+	
+	if cfg.AWSProfile != "" {
+		configOpts = append(configOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(context.Background(), configOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	s3Client := s3.NewFromConfig(awsCfg)
+	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+		o.UseDualStack = true
+		o.UseAccelerate = true
+	})
 
 	// Construct S3 key for the index file
 	indexKey := path.Join(cfg.S3Prefix, cfg.BlockID, "index")
 	
-	// Create S3 reader for the index file
-	s3Reader, err := NewS3Reader(s3Client, cfg.S3Bucket, indexKey)
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "Reading index from s3://%s/%s\n", cfg.S3Bucket, indexKey)
+	}
+
+	// Create optimized S3 reader for the index file
+	s3Reader, err := NewOptimizedS3Reader(s3Client, cfg.S3Bucket, indexKey, cfg.Debug)
 	if err != nil {
 		return fmt.Errorf("failed to create S3 reader: %w", err)
 	}
@@ -141,23 +215,38 @@ func dumpBlock(cfg Config) error {
 	}
 	defer indexReader.Close()
 
-	// Get all postings for the metric name if specified
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "Index file size: %d bytes\n", s3Reader.Size())
+	}
+
+	// Build posting lists for efficient filtering
 	var postings index.Postings
+	
 	if cfg.MetricName != "" {
-		postings, err = indexReader.Postings(labels.MetricName, cfg.MetricName)
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "Getting postings for metric: %s\n", cfg.MetricName)
+		}
+		metricPostings, err := indexReader.Postings(labels.MetricName, cfg.MetricName)
 		if err != nil {
 			return fmt.Errorf("failed to get postings for metric %s: %w", cfg.MetricName, err)
 		}
+		postings = metricPostings
 	} else {
-		// Get all postings
-		postings, err = indexReader.Postings(index.AllPostingsKey())
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "Getting all postings\n")
+		}
+		allPostings, err := indexReader.Postings(index.AllPostingsKey())
 		if err != nil {
 			return fmt.Errorf("failed to get all postings: %w", err)
 		}
+		postings = allPostings
 	}
 
 	// Additional label filtering if specified
 	if cfg.LabelKey != "" && cfg.LabelValue != "" {
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "Applying label filter: %s=%s\n", cfg.LabelKey, cfg.LabelValue)
+		}
 		labelPostings, err := indexReader.Postings(cfg.LabelKey, cfg.LabelValue)
 		if err != nil {
 			return fmt.Errorf("failed to get postings for label %s=%s: %w", cfg.LabelKey, cfg.LabelValue, err)
@@ -169,11 +258,21 @@ func dumpBlock(cfg Config) error {
 	var chunkInfos []ChunkInfo
 	var lbls labels.Labels
 	var chks []chunks.Meta
+	seriesCount := 0
+
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "Processing matching series...\n")
+	}
 
 	for postings.Next() {
 		seriesID := postings.At()
+		seriesCount++
 		
-		// Get series labels
+		if cfg.Debug && seriesCount%1000 == 0 {
+			fmt.Fprintf(os.Stderr, "Processed %d series...\n", seriesCount)
+		}
+		
+		// Get series labels and chunks
 		if err := indexReader.Series(seriesID, &lbls, &chks); err != nil {
 			return fmt.Errorf("failed to get series %d: %w", seriesID, err)
 		}
@@ -193,6 +292,18 @@ func dumpBlock(cfg Config) error {
 
 	if err := postings.Err(); err != nil {
 		return fmt.Errorf("postings iteration error: %w", err)
+	}
+
+	// Output statistics if debug is enabled
+	if cfg.Debug {
+		ranges, bytes := s3Reader.GetStats()
+		fmt.Fprintf(os.Stderr, "\nS3 Transfer Statistics:\n")
+		fmt.Fprintf(os.Stderr, "- Total series processed: %d\n", seriesCount)
+		fmt.Fprintf(os.Stderr, "- Total chunks found: %d\n", len(chunkInfos))
+		fmt.Fprintf(os.Stderr, "- S3 range requests made: %d\n", ranges)
+		fmt.Fprintf(os.Stderr, "- Total bytes downloaded: %d (%.2f%% of index file)\n", 
+			bytes, float64(bytes)/float64(s3Reader.Size())*100)
+		fmt.Fprintf(os.Stderr, "\n")
 	}
 
 	// Output as CSV
@@ -216,6 +327,9 @@ func dumpBlock(cfg Config) error {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "Found %d chunks matching criteria\n", len(chunkInfos))
+	if !cfg.Debug {
+		fmt.Fprintf(os.Stderr, "Found %d chunks matching criteria\n", len(chunkInfos))
+	}
+
 	return nil
 }

@@ -474,7 +474,7 @@ func dumpSeries(cfg Config) error {
 
 	// Get chunk locations from index
 	fmt.Fprintf(os.Stderr, "Reading chunk locations from index...\n")
-	chunkRefs, seriesLabels, err := getChunkReferences(idx, cfg)
+	chunkRefs, seriesLabels, err := getChunkReferences(*idx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to get chunk references: %w", err)
 	}
@@ -598,7 +598,7 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 		iter := chunk.Iterator(nil)
 		labelsStr := seriesLabels[i].String()
 
-		for iter.Next() {
+		for iter.Next() == chunkenc.ValFloat {
 			ts, val := iter.At()
 			
 			// Apply time range filter

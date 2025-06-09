@@ -23,6 +23,7 @@ type Config struct {
 	OutputFormat       string
 	SwitchThreshold    float64
 	DumpChunkTable     bool
+	OutputFilename     string
 }
 
 type SeriesPoint struct {

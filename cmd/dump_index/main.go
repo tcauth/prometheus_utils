@@ -32,6 +32,7 @@ func main() {
 	flag.Int64Var(&cfg.StartTime, "start-time", 0, "Start time (Unix timestamp in milliseconds, optional)")
 	flag.Int64Var(&cfg.EndTime, "end-time", 0, "End time (Unix timestamp in milliseconds, optional)")
 	flag.StringVar(&cfg.OutputFormat, "output", "csv", "Output format: csv, json, or prometheus")
+	flag.StringVar(&cfg.OutputFilename, "ouput-filename", "", "Output filename (default random 4 digits)")
 	flag.Float64Var(&cfg.SwitchThreshold, "switch-threshold", 0.2, "Switch to full download when this fraction of index file is requested (0.1-0.9, default: 0.2)")
 	flag.BoolVar(&cfg.DumpChunkTable, "dump-chunk-table", false, "Dump chunk table (chunk file, offset, size) as CSV instead of time series data")
 	flag.Parse()
@@ -247,5 +248,5 @@ func dumpSeries(cfg Config) error {
 
 	fmt.Fprintf(os.Stderr, "Extracted %d data points from %d chunk files\n", len(allPoints), len(chunksByFile))
 
-	return outputResults(allPoints, cfg)
+	return outputResults(allPoints, cfg, bucket, tenant, blockID)
 }

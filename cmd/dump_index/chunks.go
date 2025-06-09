@@ -88,7 +88,18 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]ChunkInfo, error) {
 }
 
 func outputChunkTable(chunkInfos []ChunkInfo, s3Client *s3.Client, bucket, tenant, blockID string, cfg Config) error {
-	writer := csv.NewWriter(os.Stdout)
+	outputPath, err := buildOutputPath(cfg, bucket, tenant, blockID, "csv")
+	if err != nil {
+		return fmt.Errorf("failed to build output path: %w", err)
+	}
+
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
 	// Write header
@@ -132,7 +143,7 @@ func outputChunkTable(chunkInfos []ChunkInfo, s3Client *s3.Client, bucket, tenan
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "Dumped chunk table with %d entries\n", len(chunkInfos))
+	fmt.Fprintf(os.Stderr, "Dumped chunk table with %d entries to %s\n", len(chunkInfos), outputPath)
 	return nil
 }
 

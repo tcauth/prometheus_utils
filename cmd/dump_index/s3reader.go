@@ -38,6 +38,42 @@ func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*O
 }
 
 func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug bool, cacheDir, fileType string) (*OptimizedS3Reader, error) {
+	var size int64
+
+	// If we're dealing with an index file and caching is enabled, check for a
+	// local copy before hitting S3. This avoids unnecessary downloads when the
+	// index already exists in the working directory.
+	if cacheDir != "" && fileType == "index" {
+		pathParts := strings.Split(key, "/")
+		var indexPath string
+		if len(pathParts) >= 3 && pathParts[len(pathParts)-1] == "index" {
+			indexPath = filepath.Join(cacheDir, bucket, strings.Join(pathParts[:len(pathParts)-1], string(filepath.Separator)), "index")
+		} else {
+			indexPath = filepath.Join(cacheDir, bucket, strings.ReplaceAll(key, "/", string(filepath.Separator)))
+		}
+
+		if stat, err := os.Stat(indexPath); err == nil {
+			size = stat.Size()
+			if debug {
+				fmt.Fprintf(os.Stderr, "Using cached index at %s (%d bytes)\n", indexPath, size)
+			}
+			return &OptimizedS3Reader{
+				client:        client,
+				bucket:        bucket,
+				key:           key,
+				size:          size,
+				cache:         make(map[string][]byte),
+				debug:         debug,
+				useFullData:   false,
+				threshold:     0.3,
+				localCacheDir: cacheDir,
+				fileType:      fileType,
+				indexRanges:   make(map[int64][]byte),
+			}, nil
+		}
+	}
+
+	// No cached file found; fall back to S3 HEAD request to determine size
 	headResp, err := client.HeadObject(context.Background(), &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -45,12 +81,13 @@ func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug 
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object info: %w", err)
 	}
+	size = *headResp.ContentLength
 
 	return &OptimizedS3Reader{
 		client:        client,
 		bucket:        bucket,
 		key:           key,
-		size:          *headResp.ContentLength,
+		size:          size,
 		cache:         make(map[string][]byte),
 		debug:         debug,
 		useFullData:   false,

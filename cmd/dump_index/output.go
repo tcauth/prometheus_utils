@@ -3,25 +3,71 @@ package main
 import (
 	"encoding/csv"
 	"fmt"
+	"io"
+	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
+	"time"
 )
 
-func outputResults(points []SeriesPoint, cfg Config) error {
-	switch cfg.OutputFormat {
-	case "csv":
-		return outputCSV(points)
-	case "json":
-		return outputJSON(points)
-	case "prometheus":
-		return outputPrometheus(points)
-	default:
-		return fmt.Errorf("unsupported output format: %s", cfg.OutputFormat)
+func buildOutputPath(cfg Config, bucket, tenant, blockID, ext string) (string, error) {
+	metric := cfg.MetricName
+	if metric == "" {
+		metric = "all-metrics"
 	}
+
+	name := cfg.OutputFilename
+	if name == "" {
+		rand.Seed(time.Now().UnixNano())
+		name = fmt.Sprintf("%04d", rand.Intn(10000))
+	}
+
+	dir := filepath.Join(cfg.WorkingDir, bucket, tenant, blockID, metric)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dir, name+"."+ext), nil
 }
 
-func outputCSV(points []SeriesPoint) error {
-	writer := csv.NewWriter(os.Stdout)
+func outputResults(points []SeriesPoint, cfg Config, bucket, tenant, blockID string) error {
+	ext := cfg.OutputFormat
+	if ext == "prometheus" {
+		ext = "prom"
+	}
+
+	outputPath, err := buildOutputPath(cfg, bucket, tenant, blockID, ext)
+	if err != nil {
+		return fmt.Errorf("failed to build output path: %w", err)
+	}
+
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer f.Close()
+
+	switch cfg.OutputFormat {
+	case "csv":
+		err = outputCSV(f, points)
+	case "json":
+		err = outputJSON(f, points)
+	case "prometheus":
+		err = outputPrometheus(f, points)
+	default:
+		err = fmt.Errorf("unsupported output format: %s", cfg.OutputFormat)
+	}
+
+	if err == nil {
+		fmt.Fprintf(os.Stderr, "Saved output to %s\n", outputPath)
+	}
+
+	return err
+}
+
+func outputCSV(w io.Writer, points []SeriesPoint) error {
+	writer := csv.NewWriter(w)
 	defer writer.Flush()
 
 	if err := writer.Write([]string{"series_labels", "timestamp", "value"}); err != nil {
@@ -42,24 +88,24 @@ func outputCSV(points []SeriesPoint) error {
 	return nil
 }
 
-func outputJSON(points []SeriesPoint) error {
-	fmt.Println("[")
+func outputJSON(w io.Writer, points []SeriesPoint) error {
+	fmt.Fprintln(w, "[")
 	for i, point := range points {
 		if i > 0 {
-			fmt.Println(",")
+			fmt.Fprintln(w, ",")
 		}
-		fmt.Printf(`  {"series": %q, "timestamp": %d, "value": %g}`,
+		fmt.Fprintf(w, `  {"series": %q, "timestamp": %d, "value": %g}`,
 			point.SeriesLabels, point.Timestamp, point.Value)
 	}
-	fmt.Println("\n]")
+	fmt.Fprintln(w, "\n]")
 	return nil
 }
 
-func outputPrometheus(points []SeriesPoint) error {
+func outputPrometheus(w io.Writer, points []SeriesPoint) error {
 	for _, point := range points {
 		// Convert timestamp from milliseconds to seconds for Prometheus format
 		timestampSec := float64(point.Timestamp) / 1000.0
-		fmt.Printf("%s %g %g\n", point.SeriesLabels, point.Value, timestampSec)
+		fmt.Fprintf(w, "%s %g %g\n", point.SeriesLabels, point.Value, timestampSec)
 	}
 	return nil
 }

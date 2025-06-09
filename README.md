@@ -19,4 +19,4 @@ go build ./cmd/dump_index
 ./dump_index --s3.bucket <bucket> --s3.prefix <prefix> --block.id <block-id>
 ```
 
-The generated CSV is written to standard output.
+By default the results are written under `<working-dir>/<bucket>/<tenant>/<block>/<metric-name>/<output-filename>.<ext>`. Use `-ouput-filename` to set the file name explicitly. If not provided a random 4 digit number is used.

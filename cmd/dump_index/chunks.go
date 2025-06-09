@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/csv"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
+	"path"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -63,20 +67,20 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]ChunkInfo, error) {
 				continue
 			}
 
-                        // Parse chunk reference to extract file number, offset, and length.
-                        // Chunk files on disk are numbered starting from 1, so add 1 to the
-                        // extracted file number from the reference which starts at 0.
-                        chunkRef := uint64(chk.Ref)
-                        chunkFileNum := int((chunkRef >> 56) & 0xFF) + 1 // Top 8 bits
-			chunkOffset := (chunkRef >> 24) & 0xFFFFFFFF // Next 32 bits
-			chunkLength := uint32(chunkRef & 0xFFFFFF)   // Bottom 24 bits
+			// Parse chunk reference (BlockChunkRef) to extract file number and offset.
+			// Chunk files on disk are numbered starting from 1, while the reference
+			// stores them starting from 0. Length information is not part of the
+			// reference and needs to be read from the chunk itself when processing.
+			chunkRef := uint64(chk.Ref)
+			chunkFileNum := int((chunkRef>>32)&0xFFFFFFFF) + 1 // Upper 4 bytes
+			chunkOffset := chunkRef & 0xFFFFFFFF               // Lower 4 bytes
 
 			allChunkInfos = append(allChunkInfos, ChunkInfo{
 				ChunkRef:     chk,
 				SeriesLabel:  lbls,
 				ChunkFileNum: chunkFileNum,
 				ChunkOffset:  chunkOffset,
-				ChunkLength:  chunkLength,
+				ChunkLength:  0,
 			})
 		}
 	}
@@ -84,7 +88,7 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]ChunkInfo, error) {
 	return allChunkInfos, postings.Err()
 }
 
-func outputChunkTable(chunkInfos []ChunkInfo) error {
+func outputChunkTable(chunkInfos []ChunkInfo, s3Client *s3.Client, bucket, tenant, blockID string, cfg Config) error {
 	writer := csv.NewWriter(os.Stdout)
 	defer writer.Flush()
 
@@ -93,18 +97,39 @@ func outputChunkTable(chunkInfos []ChunkInfo) error {
 		return fmt.Errorf("failed to write chunk table header: %w", err)
 	}
 
-	// Write chunk data
-	for _, chunkInfo := range chunkInfos {
-		record := []string{
-			chunkInfo.SeriesLabel.String(),
-			fmt.Sprintf("%06d", chunkInfo.ChunkFileNum),
-			strconv.FormatUint(chunkInfo.ChunkOffset, 10),
-			strconv.FormatUint(uint64(chunkInfo.ChunkLength), 10),
-			strconv.FormatInt(chunkInfo.ChunkRef.MinTime, 10),
-			strconv.FormatInt(chunkInfo.ChunkRef.MaxTime, 10),
+	chunksByFile := make(map[int][]ChunkInfo)
+	for _, ci := range chunkInfos {
+		chunksByFile[ci.ChunkFileNum] = append(chunksByFile[ci.ChunkFileNum], ci)
+	}
+
+	for fileNum, fileChunks := range chunksByFile {
+		chunksKey := path.Join(tenant, blockID, "chunks", fmt.Sprintf("%06d", fileNum))
+		chunkCacheDir := ""
+		if cfg.WorkingDir != "" {
+			chunkCacheDir = cfg.WorkingDir
 		}
-		if err := writer.Write(record); err != nil {
-			return fmt.Errorf("failed to write chunk table record: %w", err)
+
+		reader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
+		if err != nil {
+			return fmt.Errorf("failed to create chunks reader for file %06d: %w", fileNum, err)
+		}
+
+		for _, ci := range fileChunks {
+			_, length, _, err := readRawChunk(reader, ci.ChunkOffset)
+			if err != nil {
+				return fmt.Errorf("failed to read chunk at offset %d in file %06d: %w", ci.ChunkOffset, fileNum, err)
+			}
+			record := []string{
+				ci.SeriesLabel.String(),
+				fmt.Sprintf("%06d", ci.ChunkFileNum),
+				strconv.FormatUint(ci.ChunkOffset, 10),
+				strconv.FormatUint(uint64(length), 10),
+				strconv.FormatInt(ci.ChunkRef.MinTime, 10),
+				strconv.FormatInt(ci.ChunkRef.MaxTime, 10),
+			}
+			if err := writer.Write(record); err != nil {
+				return fmt.Errorf("failed to write chunk table record: %w", err)
+			}
 		}
 	}
 
@@ -188,23 +213,24 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg 
 
 func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResult, chunksReader *OptimizedS3Reader, cfg Config, chunkFileName string) {
 	for job := range jobs {
-		points, err := processOneChunk(job, chunksReader, cfg, workerID, chunkFileName)
+		points, info, err := processOneChunk(job, chunksReader, cfg, workerID, chunkFileName)
 		results <- ChunkResult{
 			Points:    points,
 			Error:     err,
 			Index:     job.Index,
-			ChunkInfo: job.ChunkInfo,
+			ChunkInfo: info,
 		}
 	}
 }
 
-func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, workerID int, chunkFileName string) ([]SeriesPoint, error) {
-	// Read chunk data using the ChunkInfo offset and length
-	chunkOffset := job.ChunkInfo.ChunkOffset
-	chunkLength := job.ChunkInfo.ChunkLength
+func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, workerID int, chunkFileName string) ([]SeriesPoint, ChunkInfo, error) {
+	info := job.ChunkInfo
+	chunkOffset := info.ChunkOffset
 
-	if chunkLength == 0 {
-		return nil, fmt.Errorf("chunk has zero length")
+	raw, chunkLen, enc, err := readRawChunk(chunksReader, chunkOffset)
+	info.ChunkLength = chunkLen
+	if err != nil {
+		return nil, info, fmt.Errorf("failed to read chunk data from %s: %w", chunkFileName, err)
 	}
 
 	// Calculate adaptive timeout based on chunk size and configuration
@@ -235,23 +261,13 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 
 	if cfg.Debug && job.Index%10000 == 0 {
 		fmt.Fprintf(os.Stderr, "\nWorker %d: Processing chunk %d from %s (offset: %d, length: %d, timeout: %v)\n",
-			workerID, job.Index+1, chunkFileName, chunkOffset, chunkLength, timeout)
-	}
-
-	chunkData := make([]byte, chunkLength)
-	n, err := chunksReader.ReadAtWithContext(ctx, chunkData, int64(chunkOffset))
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to read chunk data from %s (timeout: %v): %w", chunkFileName, timeout, err)
-	}
-
-	if n == 0 {
-		return nil, fmt.Errorf("read 0 bytes from chunk in %s", chunkFileName)
+			workerID, job.Index+1, chunkFileName, chunkOffset, chunkLen, timeout)
 	}
 
 	// Decode chunk
-	chunk, err := chunkenc.FromData(chunkenc.EncXOR, chunkData[:n])
+	chunk, err := chunkenc.FromData(chunkenc.Encoding(enc), raw)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode chunk from %s: %w", chunkFileName, err)
+		return nil, info, fmt.Errorf("failed to decode chunk from %s: %w", chunkFileName, err)
 	}
 
 	// Extract time series points
@@ -286,5 +302,44 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 			workerID, job.Index+1, chunkFileName, labelsStr, len(points))
 	}
 
-	return points, nil
+	return points, info, nil
+}
+
+func readRawChunk(r *OptimizedS3Reader, offset uint64) ([]byte, uint32, byte, error) {
+	header := make([]byte, chunks.MaxChunkLengthFieldSize+1)
+	if _, err := r.ReadAt(header, int64(offset)); err != nil && err != io.EOF {
+		return nil, 0, 0, err
+	}
+
+	dataLen, n := binary.Uvarint(header[:chunks.MaxChunkLengthFieldSize])
+	if n <= 0 {
+		return nil, 0, 0, fmt.Errorf("reading chunk length failed with %d", n)
+	}
+	enc := header[n]
+	total := n + 1 + int(dataLen) + crc32.Size
+
+	buf := make([]byte, total)
+	if _, err := r.ReadAt(buf, int64(offset)); err != nil && err != io.EOF {
+		return nil, 0, 0, err
+	}
+
+	dataStart := n + 1
+	dataEnd := dataStart + int(dataLen)
+	sum := buf[dataEnd : dataEnd+crc32.Size]
+	if err := verifyCRC32(buf[n:dataEnd], sum); err != nil {
+		return nil, 0, 0, err
+	}
+
+	return buf[dataStart:dataEnd], uint32(total), enc, nil
+}
+
+var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
+
+func verifyCRC32(data, sum []byte) error {
+	want := binary.BigEndian.Uint32(sum)
+	got := crc32.Checksum(data, castagnoliTable)
+	if want != got {
+		return fmt.Errorf("checksum mismatch expected:%x actual:%x", want, got)
+	}
+	return nil
 }

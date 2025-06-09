@@ -179,7 +179,7 @@ func dumpSeries(cfg Config) error {
 	}
 
 	if cfg.DumpChunkTable {
-		return outputChunkTable(chunkInfos)
+		return outputChunkTable(chunkInfos, s3Client, bucket, tenant, blockID, cfg)
 	}
 
 	chunksByFile := make(map[int][]ChunkInfo)

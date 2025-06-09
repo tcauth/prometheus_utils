@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -27,6 +28,7 @@ func main() {
 	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't process")
 	flag.BoolVar(&cfg.ForceIndexParallel, "force-index-parallel", false, "Force parallel download for index file")
 	flag.IntVar(&cfg.ChunkWorkers, "chunk-workers", 20, "Number of parallel workers for chunk processing (default: 20)")
+	flag.IntVar(&cfg.ChunkFileWorkers, "chunk-file-workers", 4, "Number of parallel workers processing chunk files (default: 4)")
 	flag.IntVar(&cfg.ChunkTimeout, "chunk-timeout", 0, "Timeout per chunk in seconds (default: auto-calculated based on chunk size)")
 	flag.StringVar(&cfg.WorkingDir, "working-dir", ".", "Working directory for caching downloaded files (default: current directory)")
 	flag.Int64Var(&cfg.StartTime, "start-time", 0, "Start time (Unix timestamp in milliseconds, optional)")
@@ -189,62 +191,103 @@ func dumpSeries(cfg Config) error {
 		chunksByFile[chunkInfo.ChunkFileNum] = append(chunksByFile[chunkInfo.ChunkFileNum], chunkInfo)
 	}
 
-	var allPoints []SeriesPoint
+	type chunkFileJob struct {
+		fileNum    int
+		fileChunks []ChunkInfo
+	}
 
-	for fileNum, fileChunks := range chunksByFile {
-		chunkFileName := fmt.Sprintf("%s/chunks/%06d", blockID, fileNum)
-		chunksKey := path.Join(tenant, blockID, "chunks", fmt.Sprintf("%06d", fileNum))
+	fileJobs := make(chan chunkFileJob)
+	results := make(chan []SeriesPoint)
+	errCh := make(chan error, len(chunksByFile))
 
-		if cfg.Debug {
-			fmt.Fprintf(os.Stderr, "Setting up chunks reader for s3://%s/%s (chunk file: %s, %d chunks)\n", bucket, chunksKey, chunkFileName, len(fileChunks))
-		}
+	var wg sync.WaitGroup
+	for w := 0; w < cfg.ChunkFileWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range fileJobs {
+				chunkFileName := fmt.Sprintf("%s/chunks/%06d", blockID, job.fileNum)
+				chunksKey := path.Join(tenant, blockID, "chunks", fmt.Sprintf("%06d", job.fileNum))
 
-		chunkCacheDir := ""
-		if cfg.WorkingDir != "" {
-			chunkCacheDir = cfg.WorkingDir
-		}
-
-		chunksReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
-		if err != nil {
-			if strings.Contains(err.Error(), "301") {
-				fmt.Fprintf(os.Stderr, "Got 301 redirect for chunk file - attempting region detection...\n")
-				ctx := context.Background()
-				bucketRegion, regionErr := getBucketRegion(s3Client, bucket, ctx)
-				if regionErr != nil {
-					return fmt.Errorf("failed to get bucket region: %w", regionErr)
+				if cfg.Debug {
+					fmt.Fprintf(os.Stderr, "Setting up chunks reader for s3://%s/%s (chunk file: %s, %d chunks)\n", bucket, chunksKey, chunkFileName, len(job.fileChunks))
 				}
 
-				fmt.Fprintf(os.Stderr, "Recreating client for region: %s\n", bucketRegion)
-				newConfigOpts := []func(*config.LoadOptions) error{config.WithRegion(bucketRegion)}
-				if cfg.AWSProfile != "" {
-					newConfigOpts = append(newConfigOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
+				chunkCacheDir := ""
+				if cfg.WorkingDir != "" {
+					chunkCacheDir = cfg.WorkingDir
 				}
 
-				newAwsCfg, err := config.LoadDefaultConfig(context.Background(), newConfigOpts...)
+				chunksReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
 				if err != nil {
-					return fmt.Errorf("failed to load AWS config for correct region: %w", err)
+					if strings.Contains(err.Error(), "301") {
+						fmt.Fprintf(os.Stderr, "Got 301 redirect for chunk file - attempting region detection...\n")
+						ctx := context.Background()
+						bucketRegion, regionErr := getBucketRegion(s3Client, bucket, ctx)
+						if regionErr != nil {
+							errCh <- fmt.Errorf("failed to get bucket region: %w", regionErr)
+							continue
+						}
+
+						fmt.Fprintf(os.Stderr, "Recreating client for region: %s\n", bucketRegion)
+						newConfigOpts := []func(*config.LoadOptions) error{config.WithRegion(bucketRegion)}
+						if cfg.AWSProfile != "" {
+							newConfigOpts = append(newConfigOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
+						}
+
+						newAwsCfg, err := config.LoadDefaultConfig(context.Background(), newConfigOpts...)
+						if err != nil {
+							errCh <- fmt.Errorf("failed to load AWS config for correct region: %w", err)
+							continue
+						}
+
+						s3Client = s3.NewFromConfig(newAwsCfg, func(o *s3.Options) {
+							o.UsePathStyle = true
+						})
+
+						chunksReader, err = NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
+						if err != nil {
+							errCh <- fmt.Errorf("failed to create chunks reader with correct region for file %06d: %w", job.fileNum, err)
+							continue
+						}
+					} else {
+						errCh <- fmt.Errorf("failed to create chunks reader for file %06d: %w", job.fileNum, err)
+						continue
+					}
 				}
 
-				s3Client = s3.NewFromConfig(newAwsCfg, func(o *s3.Options) {
-					o.UsePathStyle = true
-				})
-
-				chunksReader, err = NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
+				fmt.Fprintf(os.Stderr, "Reading time series data from %s (%d chunks)...\n", chunkFileName, len(job.fileChunks))
+				points, err := readChunkData(chunksReader, job.fileChunks, cfg, chunkFileName)
 				if err != nil {
-					return fmt.Errorf("failed to create chunks reader with correct region for file %06d: %w", fileNum, err)
+					errCh <- fmt.Errorf("failed to read chunk data from %s: %w", chunkFileName, err)
+					continue
 				}
-			} else {
-				return fmt.Errorf("failed to create chunks reader for file %06d: %w", fileNum, err)
+
+				results <- points
 			}
-		}
+		}()
+	}
 
-		fmt.Fprintf(os.Stderr, "Reading time series data from %s (%d chunks)...\n", chunkFileName, len(fileChunks))
-		points, err := readChunkData(chunksReader, fileChunks, cfg, chunkFileName)
-		if err != nil {
-			return fmt.Errorf("failed to read chunk data from %s: %w", chunkFileName, err)
+	go func() {
+		for fileNum, fileChunks := range chunksByFile {
+			fileJobs <- chunkFileJob{fileNum: fileNum, fileChunks: fileChunks}
 		}
+		close(fileJobs)
+	}()
 
-		allPoints = append(allPoints, points...)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var allPoints []SeriesPoint
+	for pts := range results {
+		allPoints = append(allPoints, pts...)
+	}
+
+	close(errCh)
+	if len(errCh) > 0 {
+		return <-errCh
 	}
 
 	fmt.Fprintf(os.Stderr, "Extracted %d data points from %d chunk files\n", len(allPoints), len(chunksByFile))

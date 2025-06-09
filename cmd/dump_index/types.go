@@ -16,6 +16,7 @@ type Config struct {
 	CheckRegion        bool
 	ForceIndexParallel bool
 	ChunkWorkers       int
+	ChunkFileWorkers   int
 	ChunkTimeout       int
 	WorkingDir         string
 	StartTime          int64

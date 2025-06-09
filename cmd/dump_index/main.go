@@ -4,13 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/prometheus/tsdb/index"
@@ -62,10 +65,24 @@ func dumpSeries(cfg Config) error {
 		fmt.Fprintf(os.Stderr, "  Block ID: %s\n", blockID)
 	}
 
+	var (
+		localDir    string
+		indexExists bool
+		metaExists  bool
+	)
+
 	if cfg.WorkingDir != "" {
-		localDir := localBlockPath(cfg, bucket, tenant, blockID)
+		localDir = localBlockPath(cfg, bucket, tenant, blockID)
 		indexPath := filepath.Join(localDir, "index")
 		if _, err := os.Stat(indexPath); err == nil {
+			indexExists = true
+		}
+		metaPath := filepath.Join(localDir, "meta.json")
+		if _, err := os.Stat(metaPath); err == nil {
+			metaExists = true
+		}
+
+		if indexExists && metaExists {
 			if cfg.Debug {
 				fmt.Fprintf(os.Stderr, "Using local block at %s\n", localDir)
 			}
@@ -87,6 +104,22 @@ func dumpSeries(cfg Config) error {
 	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.UsePathStyle = true
 	})
+
+	if indexExists && !metaExists {
+		metaPath := filepath.Join(localDir, "meta.json")
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "meta.json missing locally, downloading...\n")
+		}
+		if err := downloadMetaFile(s3Client, bucket, tenant, blockID, metaPath); err == nil {
+			metaExists = true
+			if cfg.Debug {
+				fmt.Fprintf(os.Stderr, "Cached meta.json to %s\n", metaPath)
+			}
+			return dumpSeriesLocal(cfg, localDir, bucket, tenant, blockID)
+		} else if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "Failed to download meta.json: %v\n", err)
+		}
+	}
 
 	if cfg.CheckRegion {
 		fmt.Fprintf(os.Stderr, "Checking bucket region...\n")
@@ -297,4 +330,30 @@ func dumpSeries(cfg Config) error {
 	fmt.Fprintf(os.Stderr, "Extracted %d data points from %d chunk files\n", len(allPoints), len(chunksByFile))
 
 	return outputResults(allPoints, cfg, bucket, tenant, blockID)
+}
+
+func downloadMetaFile(s3Client *s3.Client, bucket, tenant, blockID, destPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	key := path.Join(tenant, blockID, "meta.json")
+	resp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return err
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(destPath, data, 0644)
 }

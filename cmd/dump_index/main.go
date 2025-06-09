@@ -428,18 +428,38 @@ func (r *OptimizedS3Reader) GetStats() (int, int) {
 
 func (r *OptimizedS3Reader) readFromLocalCache(offset int64, length int64) ([]byte, bool) {
 	if r.fileType == "index" {
-		indexPath := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)), "index")
+		// For index files, the key is like "tenant/block-id/index"
+		// We want: <working-dir>/<bucket>/<tenant>/<block-id>/index
+		pathParts := strings.Split(r.key, "/")
+		var indexPath string
+		if len(pathParts) >= 3 && pathParts[len(pathParts)-1] == "index" {
+			// key = "tenant/block-id/index" -> path = <working-dir>/<bucket>/<tenant>/<block-id>/index
+			indexPath = filepath.Join(r.localCacheDir, r.bucket, strings.Join(pathParts[:len(pathParts)-1], string(filepath.Separator)), "index")
+		} else {
+			// fallback
+			indexPath = filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+		}
+		
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Checking for cached index at: %s\n", indexPath)
+		}
+		
 		if data, err := os.ReadFile(indexPath); err == nil {
 			if int64(len(data)) >= offset+length {
+				if r.debug {
+					fmt.Fprintf(os.Stderr, "Index cache hit: %s (%d bytes)\n", indexPath, len(data))
+				}
 				return data[offset : offset+length], true
 			}
 		}
 	} else if r.fileType == "chunks" {
+		// For chunk files, the key is like "tenant/block-id/chunks/000001"
+		// We want: <working-dir>/<bucket>/<tenant>/<block-id>/chunks/000001/<offset>_<length>.bin
 		chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
 		chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, length))
 		if data, err := os.ReadFile(chunkFile); err == nil {
 			if r.debug {
-				fmt.Fprintf(os.Stderr, "Cache hit: %s\n", chunkFile)
+				fmt.Fprintf(os.Stderr, "Chunk cache hit: %s\n", chunkFile)
 			}
 			return data, true
 		}
@@ -452,10 +472,21 @@ func (r *OptimizedS3Reader) saveIndexToLocalCache() {
 		return
 	}
 	
-	indexPath := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)), "index")
+	// For index files, the key is like "tenant/block-id/index"
+	// We want: <working-dir>/<bucket>/<tenant>/<block-id>/index
+	pathParts := strings.Split(r.key, "/")
+	var indexPath string
+	if len(pathParts) >= 3 && pathParts[len(pathParts)-1] == "index" {
+		// key = "tenant/block-id/index" -> path = <working-dir>/<bucket>/<tenant>/<block-id>/index
+		indexPath = filepath.Join(r.localCacheDir, r.bucket, strings.Join(pathParts[:len(pathParts)-1], string(filepath.Separator)), "index")
+	} else {
+		// fallback
+		indexPath = filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+	}
+	
 	if err := os.MkdirAll(filepath.Dir(indexPath), 0755); err != nil {
 		if r.debug {
-			fmt.Fprintf(os.Stderr, "Failed to create cache directory: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to create index cache directory: %v\n", err)
 		}
 		return
 	}
@@ -547,7 +578,18 @@ func (r *OptimizedS3Reader) reconstructAndCacheIndex() {
 	
 	// If we have good coverage (>=95%), save the index
 	if coverage >= 0.95 {
-		indexPath := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)), "index")
+		// For index files, the key is like "tenant/block-id/index"
+		// We want: <working-dir>/<bucket>/<tenant>/<block-id>/index
+		pathParts := strings.Split(r.key, "/")
+		var indexPath string
+		if len(pathParts) >= 3 && pathParts[len(pathParts)-1] == "index" {
+			// key = "tenant/block-id/index" -> path = <working-dir>/<bucket>/<tenant>/<block-id>/index
+			indexPath = filepath.Join(r.localCacheDir, r.bucket, strings.Join(pathParts[:len(pathParts)-1], string(filepath.Separator)), "index")
+		} else {
+			// fallback
+			indexPath = filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+		}
+		
 		if err := os.MkdirAll(filepath.Dir(indexPath), 0755); err != nil {
 			if r.debug {
 				fmt.Fprintf(os.Stderr, "Failed to create index cache directory: %v\n", err)

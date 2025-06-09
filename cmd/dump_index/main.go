@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -60,6 +61,17 @@ func dumpSeries(cfg Config) error {
 		fmt.Fprintf(os.Stderr, "  Bucket: %s\n", bucket)
 		fmt.Fprintf(os.Stderr, "  Tenant: %s\n", tenant)
 		fmt.Fprintf(os.Stderr, "  Block ID: %s\n", blockID)
+	}
+
+	if cfg.WorkingDir != "" {
+		localDir := localBlockPath(cfg, bucket, tenant, blockID)
+		indexPath := filepath.Join(localDir, "index")
+		if _, err := os.Stat(indexPath); err == nil {
+			if cfg.Debug {
+				fmt.Fprintf(os.Stderr, "Using local block at %s\n", localDir)
+			}
+			return dumpSeriesLocal(cfg, localDir, bucket, tenant, blockID)
+		}
 	}
 
 	var configOpts []func(*config.LoadOptions) error

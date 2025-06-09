@@ -6,26 +6,24 @@ import (
 )
 
 type Config struct {
-	BlockPath          string
-	MetricName         string
-	LabelKey           string
-	LabelValue         string
-	AWSRegion          string
-	AWSProfile         string
-	Debug              bool
-	CheckRegion        bool
-	ForceIndexParallel bool
-	ChunkWorkers       int
-	ChunkFileWorkers   int
-	ChunkTimeout       int
-	WorkingDir         string
-	StartTime          int64
-	EndTime            int64
-	OutputFormat       string
-	SwitchThreshold    float64
-	DumpChunkTable     bool
-	OutputFilename     string
-	OutputLabels       string
+	BlockPath        string
+	MetricName       string
+	LabelKey         string
+	LabelValue       string
+	AWSRegion        string
+	AWSProfile       string
+	Debug            bool
+	CheckRegion      bool
+	ChunkWorkers     int
+	ChunkFileWorkers int
+	ChunkTimeout     int
+	WorkingDir       string
+	StartTime        int64
+	EndTime          int64
+	OutputFormat     string
+	DumpChunkTable   bool
+	OutputFilename   string
+	OutputLabels     string
 }
 
 type SeriesPoint struct {

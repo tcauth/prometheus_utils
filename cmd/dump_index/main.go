@@ -27,7 +27,6 @@ func main() {
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug output")
 	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't process")
-	flag.BoolVar(&cfg.ForceIndexParallel, "force-index-parallel", true, "Force parallel download for index file")
 	flag.IntVar(&cfg.ChunkWorkers, "chunk-workers", 20, "Number of parallel workers for chunk processing (default: 20)")
 	flag.IntVar(&cfg.ChunkFileWorkers, "chunk-file-workers", 4, "Number of parallel workers processing chunk files (default: 4)")
 	flag.IntVar(&cfg.ChunkTimeout, "chunk-timeout", 0, "Timeout per chunk in seconds (default: auto-calculated based on chunk size)")
@@ -37,7 +36,6 @@ func main() {
 	flag.StringVar(&cfg.OutputFormat, "output", "csv", "Output format: csv, json, or prometheus")
 	flag.StringVar(&cfg.OutputFilename, "ouput-filename", "", "Output filename (default random 4 digits)")
 	flag.StringVar(&cfg.OutputLabels, "output-labels", "", "Comma separated list of labels to output as columns (CSV only)")
-	flag.Float64Var(&cfg.SwitchThreshold, "switch-threshold", 0.2, "Switch to full download when this fraction of index file is requested (0.1-0.9, default: 0.2)")
 	flag.BoolVar(&cfg.DumpChunkTable, "dump-chunk-table", false, "Dump chunk table (chunk file, offset, size) as CSV instead of time series data")
 	flag.Parse()
 
@@ -141,27 +139,7 @@ func dumpSeries(cfg Config) error {
 		}
 	}
 
-	indexReader.threshold = cfg.SwitchThreshold
-
-	if cfg.WorkingDir != "" && !cfg.ForceIndexParallel {
-		indexReader.threshold = 0.1
-		if cfg.Debug {
-			fmt.Fprintf(os.Stderr, "Working directory specified, lowered switch threshold to 10%% for better caching\n")
-		}
-	}
-
-	if cfg.ForceIndexParallel {
-		if cfg.Debug {
-			fmt.Fprintf(os.Stderr, "Force parallel download requested for index file...\n")
-		}
-		if err := indexReader.downloadParallel(50 * 1024 * 1024); err != nil {
-			return fmt.Errorf("failed to force download index file: %w", err)
-		}
-		if cfg.WorkingDir != "" {
-			fmt.Fprintf(os.Stderr, "Saving force-downloaded index to cache...\n")
-			indexReader.saveIndexToLocalCache()
-		}
-	}
+	// Always rely on the piece-based caching mechanism for index files
 
 	idx, err := index.NewReader(indexReader)
 	if err != nil {

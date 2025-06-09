@@ -53,3 +53,9 @@ type ChunkResult struct {
 	Index     int
 	ChunkInfo ChunkInfo
 }
+
+type FileResult struct {
+	Points  []SeriesPoint
+	Error   error
+	FileNum int
+}

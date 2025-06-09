@@ -27,6 +27,7 @@ func main() {
 	flag.StringVar(&cfg.AWSProfile, "aws-profile", "", "AWS profile name")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug output")
 	flag.BoolVar(&cfg.CheckRegion, "check-region", false, "Only check and display the bucket's region, don't process")
+	flag.BoolVar(&cfg.ForceIndexParallel, "force-index-parallel", true, "Force parallel download for index file")
 	flag.IntVar(&cfg.ChunkWorkers, "chunk-workers", 20, "Number of parallel workers for chunk processing (default: 20)")
 	flag.IntVar(&cfg.ChunkFileWorkers, "chunk-file-workers", 4, "Number of parallel workers processing chunk files (default: 4)")
 	flag.IntVar(&cfg.ChunkTimeout, "chunk-timeout", 0, "Timeout per chunk in seconds (default: auto-calculated based on chunk size)")
@@ -136,6 +137,19 @@ func dumpSeries(cfg Config) error {
 			}
 		} else {
 			return fmt.Errorf("failed to create index reader: %w", err)
+		}
+	}
+
+	if cfg.ForceIndexParallel {
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "Force parallel download requested for index file...\n")
+		}
+		if err := indexReader.downloadParallel(50 * 1024 * 1024); err != nil {
+			return fmt.Errorf("failed to force download index file: %w", err)
+		}
+		if cfg.WorkingDir != "" {
+			fmt.Fprintf(os.Stderr, "Saving force-downloaded index to cache...\n")
+			indexReader.saveIndexToLocalCache()
 		}
 	}
 

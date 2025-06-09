@@ -172,6 +172,59 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	}
 
 	// Continue with range requests
+	if r.fileType == "chunks" {
+		const pieceSize int64 = 16 * 1024 * 1024
+		bytesRead := 0
+		cur := off
+		for cur <= end {
+			pieceStart := (cur / pieceSize) * pieceSize
+			pieceLength := pieceSize
+			if pieceStart+pieceLength > r.size {
+				pieceLength = r.size - pieceStart
+			}
+
+			cacheKey := fmt.Sprintf("%d-%d", pieceStart, pieceStart+pieceLength-1)
+			r.mu.RLock()
+			pieceData, exists := r.cache[cacheKey]
+			r.mu.RUnlock()
+			if !exists {
+				pieceData, found := r.readChunkPieceFromLocalCache(pieceStart, pieceLength)
+				if !found {
+					rangeHeader := fmt.Sprintf("bytes=%d-%d", pieceStart, pieceStart+pieceLength-1)
+					resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
+						Bucket: aws.String(r.bucket),
+						Key:    aws.String(r.key),
+						Range:  aws.String(rangeHeader),
+					})
+					if err != nil {
+						return 0, fmt.Errorf("failed to read range %s: %w", rangeHeader, err)
+					}
+					pieceData, err = io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if err != nil {
+						return 0, fmt.Errorf("failed to read response body: %w", err)
+					}
+					r.saveChunkPieceToLocalCache(pieceStart, pieceData)
+				}
+				r.mu.Lock()
+				r.cache[cacheKey] = pieceData
+				r.totalRequested += int64(len(pieceData))
+				r.requestCount++
+				r.mu.Unlock()
+			}
+
+			copyStart := cur - pieceStart
+			copyLen := int64(len(pieceData)) - copyStart
+			if cur+copyLen-1 > end {
+				copyLen = end - cur + 1
+			}
+			copy(p[bytesRead:bytesRead+int(copyLen)], pieceData[copyStart:copyStart+copyLen])
+			bytesRead += int(copyLen)
+			cur += copyLen
+		}
+		return bytesRead, nil
+	}
+
 	r.mu.RLock()
 	cacheKey := fmt.Sprintf("%d-%d", off, end)
 	if data, exists := r.cache[cacheKey]; exists {
@@ -181,19 +234,11 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	}
 	r.mu.RUnlock()
 
-	// For chunks, don't use large optimized ranges - use exact ranges needed
-	var rangeStart, rangeEnd int64
-	if r.fileType == "chunks" {
-		// For chunks, read exactly what's requested (individual chunk data)
-		rangeStart = off
-		rangeEnd = end
-	} else {
-		// For index, use larger range optimization - 256KB instead of 64KB
-		rangeStart = (off / 262144) * 262144
-		rangeEnd = ((end/262144)+1)*262144 - 1
-		if rangeEnd >= r.size {
-			rangeEnd = r.size - 1
-		}
+	// For index, use larger range optimization - 256KB instead of 64KB
+	rangeStart := (off / 262144) * 262144
+	rangeEnd := ((end/262144)+1)*262144 - 1
+	if rangeEnd >= r.size {
+		rangeEnd = r.size - 1
 	}
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
@@ -213,18 +258,10 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 		return 0, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Save to local cache if enabled
 	if r.localCacheDir != "" {
-		if r.fileType == "chunks" {
-			// For chunks, cache the exact range requested
-			r.saveExactChunkToLocalCache(off, end-off+1, data)
-		} else if r.fileType == "index" {
-			// For index files, accumulate range data and save when we have enough
-			r.saveIndexRangeToLocalCache(rangeStart, data)
-		}
+		r.saveIndexRangeToLocalCache(rangeStart, data)
 	}
 
-	// Update statistics and cache
 	r.mu.Lock()
 	optimizedCacheKey := fmt.Sprintf("%d-%d", rangeStart, rangeEnd)
 	r.cache[optimizedCacheKey] = data
@@ -232,23 +269,15 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	r.requestCount++
 	r.mu.Unlock()
 
-	// Extract the requested portion
-	if r.fileType == "chunks" {
-		// For chunks, the data should be exactly what was requested
-		copy(p, data)
-		return len(data), nil
-	} else {
-		// For index, extract the requested portion from the larger range
-		requestedOffset := off - rangeStart
-		requestedLength := end - off + 1
+	requestedOffset := off - rangeStart
+	requestedLength := end - off + 1
 
-		if requestedOffset+requestedLength > int64(len(data)) {
-			requestedLength = int64(len(data)) - requestedOffset
-		}
-
-		copy(p, data[requestedOffset:requestedOffset+requestedLength])
-		return int(requestedLength), nil
+	if requestedOffset+requestedLength > int64(len(data)) {
+		requestedLength = int64(len(data)) - requestedOffset
 	}
+
+	copy(p, data[requestedOffset:requestedOffset+requestedLength])
+	return int(requestedLength), nil
 }
 
 func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
@@ -507,15 +536,51 @@ func (r *OptimizedS3Reader) saveIndexToLocalCache() {
 }
 
 func (r *OptimizedS3Reader) readChunkFromLocalCache(offset int64, length int64) ([]byte, bool) {
-	// For chunk files, try to find exact match first
-	chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
-	chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, length))
+	const pieceSize int64 = 16 * 1024 * 1024
+	if r.localCacheDir == "" {
+		return nil, false
+	}
 
-	if data, err := os.ReadFile(chunkFile); err == nil {
-		if r.debug {
-			fmt.Fprintf(os.Stderr, "Exact chunk cache hit: %s\n", chunkFile)
+	end := offset + length - 1
+	chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+
+	var result []byte
+	for partStart := (offset / pieceSize) * pieceSize; partStart <= end; partStart += pieceSize {
+		partLength := pieceSize
+		if partStart+partLength > r.size {
+			partLength = r.size - partStart
 		}
-		return data, true
+
+		partFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", partStart, partLength))
+		data, err := os.ReadFile(partFile)
+		if err != nil {
+			return nil, false
+		}
+
+		var sliceStart int64
+		if partStart < offset {
+			sliceStart = offset - partStart
+		}
+		sliceEnd := partLength
+		if partStart+partLength-1 > end {
+			sliceEnd = end - partStart + 1
+		}
+
+		if sliceStart >= int64(len(data)) {
+			return nil, false
+		}
+		if sliceStart+sliceEnd > int64(len(data)) {
+			sliceEnd = int64(len(data)) - sliceStart
+		}
+
+		result = append(result, data[sliceStart:sliceStart+sliceEnd]...)
+	}
+
+	if int64(len(result)) == length {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Chunk cache hit for offset %d length %d\n", offset, length)
+		}
+		return result, true
 	}
 
 	return nil, false
@@ -537,10 +602,50 @@ func (r *OptimizedS3Reader) saveExactChunkToLocalCache(offset int64, length int6
 	chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, length))
 	if err := os.WriteFile(chunkFile, data, 0644); err != nil {
 		if r.debug {
-			fmt.Fprintf(os.Stderr, "Failed to cache exact chunk: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to cache chunk piece: %v\n", err)
 		}
 	} else if r.debug {
-		fmt.Fprintf(os.Stderr, "Cached exact chunk to: %s\n", chunkFile)
+		fmt.Fprintf(os.Stderr, "Cached chunk piece to: %s\n", chunkFile)
+	}
+}
+
+func (r *OptimizedS3Reader) readChunkPieceFromLocalCache(offset int64, length int64) ([]byte, bool) {
+	if r.localCacheDir == "" {
+		return nil, false
+	}
+
+	chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+	chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, length))
+	data, err := os.ReadFile(chunkFile)
+	if err == nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Chunk piece cache hit: %s\n", chunkFile)
+		}
+		return data, true
+	}
+	return nil, false
+}
+
+func (r *OptimizedS3Reader) saveChunkPieceToLocalCache(offset int64, data []byte) {
+	if r.localCacheDir == "" {
+		return
+	}
+
+	chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+	if err := os.MkdirAll(chunkCacheDir, 0755); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to create chunk cache directory: %v\n", err)
+		}
+		return
+	}
+
+	chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, len(data)))
+	if err := os.WriteFile(chunkFile, data, 0644); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to cache chunk piece: %v\n", err)
+		}
+	} else if r.debug {
+		fmt.Fprintf(os.Stderr, "Cached chunk piece to: %s\n", chunkFile)
 	}
 }
 

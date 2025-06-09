@@ -63,10 +63,11 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]ChunkInfo, error) {
 				continue
 			}
 
-			// Parse chunk reference to extract file number, offset, and length
-			// TSDB chunk reference format: [8 bits: file_num][32 bits: offset][24 bits: length]
-			chunkRef := uint64(chk.Ref)
-			chunkFileNum := int((chunkRef >> 56) & 0xFF) // Top 8 bits
+                        // Parse chunk reference to extract file number, offset, and length.
+                        // Chunk files on disk are numbered starting from 1, so add 1 to the
+                        // extracted file number from the reference which starts at 0.
+                        chunkRef := uint64(chk.Ref)
+                        chunkFileNum := int((chunkRef >> 56) & 0xFF) + 1 // Top 8 bits
 			chunkOffset := (chunkRef >> 24) & 0xFFFFFFFF // Next 32 bits
 			chunkLength := uint32(chunkRef & 0xFFFFFF)   // Bottom 24 bits
 

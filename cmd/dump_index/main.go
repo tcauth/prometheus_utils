@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,27 +25,41 @@ import (
 )
 
 type Config struct {
-	BlockPath       string
-	MetricName      string
-	LabelKey        string
-	LabelValue      string
-	AWSRegion       string
-	AWSProfile      string
-	Debug           bool
-	CheckRegion     bool
+	BlockPath          string
+	MetricName         string
+	LabelKey           string
+	LabelValue         string
+	AWSRegion          string
+	AWSProfile         string
+	Debug              bool
+	CheckRegion        bool
 	ForceIndexParallel bool
-	ChunkWorkers    int
-	ChunkTimeout    int
-	StartTime       int64
-	EndTime         int64
-	OutputFormat    string
-	SwitchThreshold float64
+	ChunkWorkers       int
+	ChunkTimeout       int
+	WorkingDir         string
+	StartTime          int64
+	EndTime            int64
+	OutputFormat       string
+	SwitchThreshold    float64
 }
 
 type SeriesPoint struct {
 	SeriesLabels string
 	Timestamp    int64
 	Value        float64
+}
+
+type ChunkJob struct {
+	Index       int
+	ChunkRef    chunks.Meta
+	SeriesLabel labels.Labels
+}
+
+type ChunkResult struct {
+	Points   []SeriesPoint
+	Error    error
+	Index    int
+	ChunkRef chunks.Meta
 }
 
 type OptimizedS3Reader struct {
@@ -57,12 +72,18 @@ type OptimizedS3Reader struct {
 	data           []byte
 	useFullData    bool
 	mu             sync.RWMutex
-	totalRequested int64  // Track how much data we've requested via ranges
-	requestCount   int    // Track number of range requests
-	threshold      float64 // When to switch to full download (e.g., 0.3 = 30%)
+	totalRequested int64
+	requestCount   int
+	threshold      float64
+	localCacheDir  string
+	fileType       string
 }
 
 func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*OptimizedS3Reader, error) {
+	return NewOptimizedS3ReaderWithCache(client, bucket, key, debug, "", "")
+}
+
+func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug bool, cacheDir, fileType string) (*OptimizedS3Reader, error) {
 	headResp, err := client.HeadObject(context.Background(), &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -72,19 +93,20 @@ func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*O
 	}
 
 	return &OptimizedS3Reader{
-		client:      client,
-		bucket:      bucket,
-		key:         key,
-		size:        *headResp.ContentLength,
-		cache:       make(map[string][]byte),
-		debug:       debug,
-		useFullData: false,
-		threshold:   0.3, // Switch to full download when we've requested 30% of the file
+		client:        client,
+		bucket:        bucket,
+		key:           key,
+		size:          *headResp.ContentLength,
+		cache:         make(map[string][]byte),
+		debug:         debug,
+		useFullData:   false,
+		threshold:     0.3,
+		localCacheDir: cacheDir,
+		fileType:      fileType,
 	}, nil
 }
 
 func (r *OptimizedS3Reader) ReadAt(p []byte, off int64) (n int, err error) {
-	// Use a default context with reasonable timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	return r.ReadAtWithContext(ctx, p, off)
@@ -106,32 +128,42 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 		return int(requestedLength), nil
 	}
 
-	// Check if we should switch to full download - be more aggressive
+	// Check local cache first if caching is enabled
+	if r.localCacheDir != "" && r.fileType == "chunks" {
+		cachedData, found := r.readFromLocalCache(off, end-off+1)
+		if found {
+			copy(p, cachedData)
+			return len(cachedData), nil
+		}
+	}
+
+	// Check if we should switch to full download for index files
 	r.mu.Lock()
 	requestedDataRatio := float64(r.totalRequested) / float64(r.size)
-	shouldSwitchToFull := requestedDataRatio > r.threshold || r.requestCount > 15 // Reduced from 20 to 15
+	shouldSwitchToFull := requestedDataRatio > r.threshold || r.requestCount > 15
 	r.mu.Unlock()
 
-	if shouldSwitchToFull && !r.useFullData {
+	if shouldSwitchToFull && !r.useFullData && r.fileType == "index" {
 		if r.debug {
 			fmt.Fprintf(os.Stderr, "Switching to full download: %.1f%% of file requested in %d requests\n", 
 				requestedDataRatio*100, r.requestCount)
 		}
 		
-		// Download the entire file using parallel download with larger chunks
-		if err := r.downloadParallel(50 * 1024 * 1024); err != nil { // 50MB chunks instead of 10MB
+		if err := r.downloadParallel(50 * 1024 * 1024); err != nil {
 			if r.debug {
 				fmt.Fprintf(os.Stderr, "Failed to download full file, continuing with range requests: %v\n", err)
 			}
 		} else {
-			// Now use the full data
+			if r.localCacheDir != "" && r.fileType == "index" {
+				r.saveIndexToLocalCache()
+			}
 			requestedLength := end - off + 1
 			copy(p, r.data[off:off+requestedLength])
 			return int(requestedLength), nil
 		}
 	}
 
-	// Continue with range requests - use larger ranges
+	// Continue with range requests
 	r.mu.RLock()
 	cacheKey := fmt.Sprintf("%d-%d", off, end)
 	if data, exists := r.cache[cacheKey]; exists {
@@ -165,6 +197,11 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 		return 0, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	// Save to local cache if enabled and this is a chunk
+	if r.localCacheDir != "" && r.fileType == "chunks" {
+		r.saveChunkToLocalCache(optimizedStart, data)
+	}
+
 	// Update statistics and cache
 	r.mu.Lock()
 	optimizedCacheKey := fmt.Sprintf("%d-%d", optimizedStart, optimizedEnd)
@@ -193,16 +230,12 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 			numChunks, chunkSize/(1024*1024))
 	}
 
-	// Pre-allocate the data slice
 	r.data = make([]byte, r.size)
-	
 	startTime := time.Now()
 	
-	// Progress tracking
 	var totalWritten int64
 	var mu sync.Mutex
 	
-	// Progress reporting
 	progressTicker := time.NewTicker(1 * time.Second)
 	defer progressTicker.Stop()
 	
@@ -228,23 +261,21 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 		}
 	}()
 
-	// Use larger chunk size for better performance (50MB instead of 10MB)
 	if chunkSize < 50*1024*1024 {
 		chunkSize = 50 * 1024 * 1024
 		numChunks = (r.size + chunkSize - 1) / chunkSize
 	}
 
-	// Download chunks in parallel with higher concurrency
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 20) // Increase to 20 concurrent downloads
+	semaphore := make(chan struct{}, 20)
 	errChan := make(chan error, numChunks)
 
 	for i := int64(0); i < numChunks; i++ {
 		wg.Add(1)
 		go func(chunkNum int64) {
 			defer wg.Done()
-			semaphore <- struct{}{} // Acquire
-			defer func() { <-semaphore }() // Release
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
 			start := chunkNum * chunkSize
 			end := start + chunkSize - 1
@@ -252,7 +283,6 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 				end = r.size - 1
 			}
 
-			// Use shorter timeout and retry logic
 			maxRetries := 3
 			var chunkData []byte
 			var err error
@@ -271,20 +301,19 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 					cancel()
 					err = reqErr
 					if retry < maxRetries-1 {
-						time.Sleep(time.Duration(retry+1) * time.Second) // Exponential backoff
+						time.Sleep(time.Duration(retry+1) * time.Second)
 						continue
 					}
 					errChan <- fmt.Errorf("failed to download chunk %d after %d retries: %w", chunkNum, maxRetries, reqErr)
 					return
 				}
 
-				// Read with a larger buffer
 				chunkData, err = io.ReadAll(resp.Body)
 				resp.Body.Close()
 				cancel()
 				
 				if err == nil {
-					break // Success
+					break
 				}
 				
 				if retry < maxRetries-1 {
@@ -297,10 +326,8 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 				return
 			}
 
-			// Write to the correct position in the data slice
 			copy(r.data[start:start+int64(len(chunkData))], chunkData)
 
-			// Update progress
 			mu.Lock()
 			totalWritten += int64(len(chunkData))
 			mu.Unlock()
@@ -308,12 +335,10 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 		}(i)
 	}
 
-	// Wait for all chunks to complete
 	wg.Wait()
-	done <- true // Stop progress reporting
+	done <- true
 	close(errChan)
 
-	// Check for errors
 	for err := range errChan {
 		if err != nil {
 			return err
@@ -363,6 +388,85 @@ func (r *OptimizedS3Reader) Sub(start, end int) index.ByteSlice {
 
 func (r *OptimizedS3Reader) Size() int64 {
 	return r.size
+}
+
+func (r *OptimizedS3Reader) GetStats() (int, int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	
+	if r.useFullData {
+		return 1, len(r.data)
+	}
+	
+	totalRanges := len(r.cache)
+	totalBytes := int(r.totalRequested)
+	return totalRanges, totalBytes
+}
+
+func (r *OptimizedS3Reader) readFromLocalCache(offset int64, length int64) ([]byte, bool) {
+	if r.fileType == "index" {
+		indexPath := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)), "index")
+		if data, err := os.ReadFile(indexPath); err == nil {
+			if int64(len(data)) >= offset+length {
+				return data[offset : offset+length], true
+			}
+		}
+	} else if r.fileType == "chunks" {
+		chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+		chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, length))
+		if data, err := os.ReadFile(chunkFile); err == nil {
+			if r.debug {
+				fmt.Fprintf(os.Stderr, "Cache hit: %s\n", chunkFile)
+			}
+			return data, true
+		}
+	}
+	return nil, false
+}
+
+func (r *OptimizedS3Reader) saveIndexToLocalCache() {
+	if r.data == nil || r.localCacheDir == "" {
+		return
+	}
+	
+	indexPath := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)), "index")
+	if err := os.MkdirAll(filepath.Dir(indexPath), 0755); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to create cache directory: %v\n", err)
+		}
+		return
+	}
+	
+	if err := os.WriteFile(indexPath, r.data, 0644); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to cache index file: %v\n", err)
+		}
+	} else if r.debug {
+		fmt.Fprintf(os.Stderr, "Cached index file to: %s\n", indexPath)
+	}
+}
+
+func (r *OptimizedS3Reader) saveChunkToLocalCache(offset int64, data []byte) {
+	if r.localCacheDir == "" {
+		return
+	}
+	
+	chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+	if err := os.MkdirAll(chunkCacheDir, 0755); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to create chunk cache directory: %v\n", err)
+		}
+		return
+	}
+	
+	chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, len(data)))
+	if err := os.WriteFile(chunkFile, data, 0644); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to cache chunk: %v\n", err)
+		}
+	} else if r.debug {
+		fmt.Fprintf(os.Stderr, "Cached chunk to: %s\n", chunkFile)
+	}
 }
 
 type simpleByteSlice struct {
@@ -430,6 +534,7 @@ func main() {
 	flag.BoolVar(&cfg.ForceIndexParallel, "force-index-parallel", false, "Force parallel download for index file")
 	flag.IntVar(&cfg.ChunkWorkers, "chunk-workers", 20, "Number of parallel workers for chunk processing (default: 20)")
 	flag.IntVar(&cfg.ChunkTimeout, "chunk-timeout", 0, "Timeout per chunk in seconds (default: auto-calculated based on chunk size)")
+	flag.StringVar(&cfg.WorkingDir, "working-dir", ".", "Working directory for caching downloaded files (default: current directory)")
 	flag.Int64Var(&cfg.StartTime, "start-time", 0, "Start time (Unix timestamp in milliseconds, optional)")
 	flag.Int64Var(&cfg.EndTime, "end-time", 0, "End time (Unix timestamp in milliseconds, optional)")
 	flag.StringVar(&cfg.OutputFormat, "output", "csv", "Output format: csv, json, or prometheus")
@@ -472,10 +577,6 @@ func dumpSeries(cfg Config) error {
 
 	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.UsePathStyle = true
-		// Enable optimizations for better performance
-		if o.HTTPClient != nil {
-			// Increase connection pool and timeouts for better performance
-		}
 	})
 
 	if cfg.CheckRegion {
@@ -490,9 +591,14 @@ func dumpSeries(cfg Config) error {
 		return nil
 	}
 
-	// Read index to get chunk locations
+	// Read index to get chunk locations (with caching)
 	indexKey := path.Join(tenant, blockID, "index")
-	indexReader, err := NewOptimizedS3Reader(s3Client, bucket, indexKey, cfg.Debug)
+	indexCacheDir := ""
+	if cfg.WorkingDir != "" {
+		indexCacheDir = cfg.WorkingDir
+	}
+	
+	indexReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, indexKey, cfg.Debug, indexCacheDir, "index")
 	if err != nil {
 		if strings.Contains(err.Error(), "301") {
 			fmt.Fprintf(os.Stderr, "Got 301 redirect - attempting region detection...\n")
@@ -517,7 +623,7 @@ func dumpSeries(cfg Config) error {
 				o.UsePathStyle = true
 			})
 			
-			indexReader, err = NewOptimizedS3Reader(s3Client, bucket, indexKey, cfg.Debug)
+			indexReader, err = NewOptimizedS3ReaderWithCache(s3Client, bucket, indexKey, cfg.Debug, indexCacheDir, "index")
 			if err != nil {
 				return fmt.Errorf("failed to create index reader with correct region: %w", err)
 			}
@@ -556,11 +662,21 @@ func dumpSeries(cfg Config) error {
 
 	// Read chunks file to get actual data (DON'T download the entire file)
 	chunksKey := path.Join(tenant, blockID, "chunks", "000001")
+	chunkFileName := fmt.Sprintf("%s/chunks/000001", blockID)
+	
 	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "Setting up chunks reader for s3://%s/%s\n", bucket, chunksKey)
+		fmt.Fprintf(os.Stderr, "Setting up chunks reader for s3://%s/%s (chunk file: %s)\n", bucket, chunksKey, chunkFileName)
+		if cfg.WorkingDir != "" {
+			fmt.Fprintf(os.Stderr, "Using working directory for caching: %s\n", cfg.WorkingDir)
+		}
 	}
 	
-	chunksReader, err := NewOptimizedS3Reader(s3Client, bucket, chunksKey, cfg.Debug)
+	chunkCacheDir := ""
+	if cfg.WorkingDir != "" {
+		chunkCacheDir = cfg.WorkingDir
+	}
+	
+	chunksReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
 	if err != nil {
 		return fmt.Errorf("failed to create chunks reader: %w", err)
 	}
@@ -576,8 +692,8 @@ func dumpSeries(cfg Config) error {
 		fmt.Fprintf(os.Stderr, "Will process chunks using %d parallel workers with targeted range requests\n", cfg.ChunkWorkers)
 	}
 
-	fmt.Fprintf(os.Stderr, "Reading time series data from chunks...\n")
-	points, err := readChunkData(chunksReader, chunkRefs, seriesLabels, cfg)
+	fmt.Fprintf(os.Stderr, "Reading time series data from %s...\n", chunkFileName)
+	points, err := readChunkData(chunksReader, chunkRefs, seriesLabels, cfg, chunkFileName)
 	if err != nil {
 		return fmt.Errorf("failed to read chunk data: %w", err)
 	}
@@ -644,24 +760,11 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]chunks.Meta, []labels.L
 	return allChunks, allLabels, postings.Err()
 }
 
-type ChunkJob struct {
-	Index       int
-	ChunkRef    chunks.Meta
-	SeriesLabel labels.Labels
-}
-
-type ChunkResult struct {
-	Points   []SeriesPoint
-	Error    error
-	Index    int
-	ChunkRef chunks.Meta
-}
-
-func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, seriesLabels []labels.Labels, cfg Config) ([]SeriesPoint, error) {
+func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, seriesLabels []labels.Labels, cfg Config, chunkFileName string) ([]SeriesPoint, error) {
 	var allPoints []SeriesPoint
 	startTime := time.Now()
 
-	fmt.Fprintf(os.Stderr, "Processing %d chunks using %d parallel workers...\n", len(chunkRefs), cfg.ChunkWorkers)
+	fmt.Fprintf(os.Stderr, "Processing %d chunks from %s using %d parallel workers...\n", len(chunkRefs), chunkFileName, cfg.ChunkWorkers)
 
 	// Create job and result channels
 	jobs := make(chan ChunkJob, len(chunkRefs))
@@ -673,7 +776,7 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			processChunks(workerID, jobs, results, chunksReader, cfg)
+			processChunks(workerID, jobs, results, chunksReader, cfg, chunkFileName)
 		}(w)
 	}
 
@@ -706,8 +809,8 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 		if result.Error != nil {
 			chunkOffset := uint64(result.ChunkRef.Ref) >> 32
 			chunkLength := uint32(result.ChunkRef.Ref)
-			fmt.Fprintf(os.Stderr, "\nWarning: chunk %d/%d (offset: %d, length: %d) failed: %v\n", 
-				result.Index+1, len(chunkRefs), chunkOffset, chunkLength, result.Error)
+			fmt.Fprintf(os.Stderr, "\nWarning: chunk %d/%d from %s (offset: %d, length: %d) failed: %v\n", 
+				result.Index+1, len(chunkRefs), chunkFileName, chunkOffset, chunkLength, result.Error)
 		} else {
 			allPoints = append(allPoints, result.Points...)
 			totalPoints += len(result.Points)
@@ -728,15 +831,15 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 
 	// Clear progress line and show final stats
 	elapsed := time.Since(startTime)
-	fmt.Fprintf(os.Stderr, "\rCompleted processing %d chunks in %v using %d workers - Extracted %d data points                    \n", 
-		len(chunkRefs), elapsed, cfg.ChunkWorkers, len(allPoints))
+	fmt.Fprintf(os.Stderr, "\rCompleted processing %d chunks from %s in %v using %d workers - Extracted %d data points                    \n", 
+		len(chunkRefs), chunkFileName, elapsed, cfg.ChunkWorkers, len(allPoints))
 
 	return allPoints, nil
 }
 
-func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResult, chunksReader *OptimizedS3Reader, cfg Config) {
+func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResult, chunksReader *OptimizedS3Reader, cfg Config, chunkFileName string) {
 	for job := range jobs {
-		points, err := processOneChunk(job, chunksReader, cfg, workerID)
+		points, err := processOneChunk(job, chunksReader, cfg, workerID, chunkFileName)
 		results <- ChunkResult{
 			Points:   points,
 			Error:    err,
@@ -746,7 +849,7 @@ func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResul
 	}
 }
 
-func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, workerID int) ([]SeriesPoint, error) {
+func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, workerID int, chunkFileName string) ([]SeriesPoint, error) {
 	// Read chunk data using the reference offset
 	chunkOffset := uint64(job.ChunkRef.Ref) >> 32 // Higher 32 bits are offset
 	chunkLength := uint32(job.ChunkRef.Ref)       // Lower 32 bits are length
@@ -782,24 +885,24 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 	defer cancel()
 	
 	if cfg.Debug && job.Index%10000 == 0 {
-		fmt.Fprintf(os.Stderr, "\nWorker %d: Processing chunk %d (offset: %d, length: %d, timeout: %v)\n", 
-			workerID, job.Index+1, chunkOffset, chunkLength, timeout)
+		fmt.Fprintf(os.Stderr, "\nWorker %d: Processing chunk %d from %s (offset: %d, length: %d, timeout: %v)\n", 
+			workerID, job.Index+1, chunkFileName, chunkOffset, chunkLength, timeout)
 	}
 	
 	chunkData := make([]byte, chunkLength)
 	n, err := chunksReader.ReadAtWithContext(ctx, chunkData, int64(chunkOffset))
 	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to read chunk data (timeout: %v): %w", timeout, err)
+		return nil, fmt.Errorf("failed to read chunk data from %s (timeout: %v): %w", chunkFileName, timeout, err)
 	}
 
 	if n == 0 {
-		return nil, fmt.Errorf("read 0 bytes from chunk")
+		return nil, fmt.Errorf("read 0 bytes from chunk in %s", chunkFileName)
 	}
 
 	// Decode chunk
 	chunk, err := chunkenc.FromData(chunkenc.EncXOR, chunkData[:n])
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode chunk: %w", err)
+		return nil, fmt.Errorf("failed to decode chunk from %s: %w", chunkFileName, err)
 	}
 
 	// Extract time series points
@@ -826,12 +929,12 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 	}
 
 	if err := iter.Err(); err != nil {
-		return points, fmt.Errorf("iterator error: %w", err)
+		return points, fmt.Errorf("iterator error in %s: %w", chunkFileName, err)
 	}
 
 	if cfg.Debug && len(points) > 0 && job.Index%10000 == 0 {
-		fmt.Fprintf(os.Stderr, "Worker %d: chunk %d (series: %s) extracted %d points\n", 
-			workerID, job.Index+1, labelsStr, len(points))
+		fmt.Fprintf(os.Stderr, "Worker %d: chunk %d from %s (series: %s) extracted %d points\n", 
+			workerID, job.Index+1, chunkFileName, labelsStr, len(points))
 	}
 
 	return points, nil

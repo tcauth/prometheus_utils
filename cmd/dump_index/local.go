@@ -62,7 +62,7 @@ func dumpSeriesLocal(cfg Config, blockDir, bucket, tenant, blockID string) error
 			if cfg.EndTime > 0 && meta.MinTime > cfg.EndTime {
 				continue
 			}
-			chk, _, err := chunkr.ChunkOrIterable(meta)
+			chk, err := chunkr.Chunk(meta)
 			if err != nil {
 				return fmt.Errorf("chunk read: %w", err)
 			}
@@ -99,7 +99,7 @@ func dumpSeriesLocal(cfg Config, blockDir, bucket, tenant, blockID string) error
 	return outputResults(allPoints, cfg, bucket, tenant, blockID)
 }
 
-func postingsFromConfig(idx index.Reader, cfg Config) (index.Postings, error) {
+func postingsFromConfig(idx tsdb.IndexReader, cfg Config) (index.Postings, error) {
 	var (
 		p   index.Postings
 		err error

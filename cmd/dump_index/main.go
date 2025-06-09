@@ -146,8 +146,8 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 				return int(requestedLength), nil
 			}
 		} else if r.fileType == "chunks" {
-			// For chunk files, check specific range cache
-			cachedData, found := r.readFromLocalCache(off, end-off+1)
+			// For chunk files, check if the exact range is cached
+			cachedData, found := r.readChunkFromLocalCache(off, end-off+1)
 			if found {
 				copy(p, cachedData)
 				return len(cachedData), nil
@@ -191,14 +191,22 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	}
 	r.mu.RUnlock()
 
-	// Use larger range optimization - 256KB instead of 64KB
-	optimizedStart := (off / 262144) * 262144
-	optimizedEnd := ((end / 262144) + 1) * 262144 - 1
-	if optimizedEnd >= r.size {
-		optimizedEnd = r.size - 1
+	// For chunks, don't use large optimized ranges - use exact ranges needed
+	var rangeStart, rangeEnd int64
+	if r.fileType == "chunks" {
+		// For chunks, read exactly what's requested (individual chunk data)
+		rangeStart = off
+		rangeEnd = end
+	} else {
+		// For index, use larger range optimization - 256KB instead of 64KB
+		rangeStart = (off / 262144) * 262144
+		rangeEnd = ((end / 262144) + 1) * 262144 - 1
+		if rangeEnd >= r.size {
+			rangeEnd = r.size - 1
+		}
 	}
 
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", optimizedStart, optimizedEnd)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
 	
 	resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(r.bucket),
@@ -218,31 +226,39 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	// Save to local cache if enabled
 	if r.localCacheDir != "" {
 		if r.fileType == "chunks" {
-			r.saveChunkToLocalCache(optimizedStart, data)
+			// For chunks, cache the exact range requested
+			r.saveExactChunkToLocalCache(off, end-off+1, data)
 		} else if r.fileType == "index" {
 			// For index files, accumulate range data and save when we have enough
-			r.saveIndexRangeToLocalCache(optimizedStart, data)
+			r.saveIndexRangeToLocalCache(rangeStart, data)
 		}
 	}
 
 	// Update statistics and cache
 	r.mu.Lock()
-	optimizedCacheKey := fmt.Sprintf("%d-%d", optimizedStart, optimizedEnd)
+	optimizedCacheKey := fmt.Sprintf("%d-%d", rangeStart, rangeEnd)
 	r.cache[optimizedCacheKey] = data
 	r.totalRequested += int64(len(data))
 	r.requestCount++
 	r.mu.Unlock()
 
 	// Extract the requested portion
-	requestedOffset := off - optimizedStart
-	requestedLength := end - off + 1
-	
-	if requestedOffset+requestedLength > int64(len(data)) {
-		requestedLength = int64(len(data)) - requestedOffset
-	}
+	if r.fileType == "chunks" {
+		// For chunks, the data should be exactly what was requested
+		copy(p, data)
+		return len(data), nil
+	} else {
+		// For index, extract the requested portion from the larger range
+		requestedOffset := off - rangeStart
+		requestedLength := end - off + 1
+		
+		if requestedOffset+requestedLength > int64(len(data)) {
+			requestedLength = int64(len(data)) - requestedOffset
+		}
 
-	copy(p, data[requestedOffset:requestedOffset+requestedLength])
-	return int(requestedLength), nil
+		copy(p, data[requestedOffset:requestedOffset+requestedLength])
+		return int(requestedLength), nil
+	}
 }
 
 func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
@@ -500,6 +516,44 @@ func (r *OptimizedS3Reader) saveIndexToLocalCache() {
 	}
 }
 
+func (r *OptimizedS3Reader) readChunkFromLocalCache(offset int64, length int64) ([]byte, bool) {
+	// For chunk files, try to find exact match first
+	chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+	chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, length))
+	
+	if data, err := os.ReadFile(chunkFile); err == nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Exact chunk cache hit: %s\n", chunkFile)
+		}
+		return data, true
+	}
+	
+	return nil, false
+}
+
+func (r *OptimizedS3Reader) saveExactChunkToLocalCache(offset int64, length int64, data []byte) {
+	if r.localCacheDir == "" {
+		return
+	}
+	
+	chunkCacheDir := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)))
+	if err := os.MkdirAll(chunkCacheDir, 0755); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to create chunk cache directory: %v\n", err)
+		}
+		return
+	}
+	
+	chunkFile := filepath.Join(chunkCacheDir, fmt.Sprintf("%d_%d.bin", offset, length))
+	if err := os.WriteFile(chunkFile, data, 0644); err != nil {
+		if r.debug {
+			fmt.Fprintf(os.Stderr, "Failed to cache exact chunk: %v\n", err)
+		}
+	} else if r.debug {
+		fmt.Fprintf(os.Stderr, "Cached exact chunk to: %s\n", chunkFile)
+	}
+}
+
 func (r *OptimizedS3Reader) saveChunkToLocalCache(offset int64, data []byte) {
 	if r.localCacheDir == "" {
 		return
@@ -531,6 +585,11 @@ func (r *OptimizedS3Reader) saveIndexRangeToLocalCache(offset int64, data []byte
 	// Accumulate index ranges in memory
 	r.indexRanges[offset] = data
 	
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "Accumulated index range: offset=%d, length=%d (total ranges: %d)\n", 
+			offset, len(data), len(r.indexRanges))
+	}
+	
 	// Check if we should try to reconstruct the full index
 	// This is a simple heuristic - if we have enough data, try to reconstruct
 	totalCachedBytes := int64(0)
@@ -538,8 +597,15 @@ func (r *OptimizedS3Reader) saveIndexRangeToLocalCache(offset int64, data []byte
 		totalCachedBytes += int64(len(rangeData))
 	}
 	
+	coverage := float64(totalCachedBytes) / float64(r.size)
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "Index coverage so far: %.1f%% (%d/%d bytes)\n", 
+			coverage*100, totalCachedBytes, r.size)
+	}
+	
 	// If we have >= 90% of the file in ranges, reconstruct and cache the full index
-	if float64(totalCachedBytes) >= float64(r.size)*0.9 {
+	if coverage >= 0.9 {
+		fmt.Fprintf(os.Stderr, "Triggering index reconstruction at %.1f%% coverage...\n", coverage*100)
 		r.reconstructAndCacheIndex()
 	}
 }
@@ -780,6 +846,15 @@ func dumpSeries(cfg Config) error {
 	// Set the switch threshold
 	indexReader.threshold = cfg.SwitchThreshold
 	
+	// For debugging/testing, if working directory is specified, be more aggressive about caching
+	if cfg.WorkingDir != "" && !cfg.ForceIndexParallel {
+		// Lower the threshold to force full download sooner for caching
+		indexReader.threshold = 0.1 // Switch at 10% instead of default 20%
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "Working directory specified, lowered switch threshold to 10%% for better caching\n")
+		}
+	}
+	
 	// Force parallel download for index if requested
 	if cfg.ForceIndexParallel {
 		if cfg.Debug {
@@ -788,6 +863,11 @@ func dumpSeries(cfg Config) error {
 		if err := indexReader.downloadParallel(50 * 1024 * 1024); err != nil {
 			return fmt.Errorf("failed to force download index file: %w", err)
 		}
+		// Save to cache after forced download
+		if cfg.WorkingDir != "" {
+			fmt.Fprintf(os.Stderr, "Saving force-downloaded index to cache...\n")
+			indexReader.saveIndexToLocalCache()
+		}
 	}
 
 	idx, err := index.NewReader(indexReader)
@@ -795,6 +875,18 @@ func dumpSeries(cfg Config) error {
 		return fmt.Errorf("failed to open index reader: %w", err)
 	}
 	defer idx.Close()
+
+	// After index processing is complete, try to save any accumulated ranges
+	defer func() {
+		if cfg.WorkingDir != "" && indexReader.fileType == "index" && !indexReader.useFullData {
+			// Check if we have any ranges accumulated
+			if len(indexReader.indexRanges) > 0 {
+				fmt.Fprintf(os.Stderr, "Processing completed, checking if we can reconstruct index from %d ranges...\n", 
+					len(indexReader.indexRanges))
+				indexReader.reconstructAndCacheIndex()
+			}
+		}
+	}()
 
 	// Get chunk locations from index
 	fmt.Fprintf(os.Stderr, "Reading chunk locations from index...\n")

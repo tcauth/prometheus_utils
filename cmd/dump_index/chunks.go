@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
@@ -244,7 +243,7 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 		// Additional time: 1 second per 1KB of chunk data
 		// Minimum: 30 seconds, Maximum: 5 minutes
 		baseTimeout := 30 * time.Second
-		sizeBasedTimeout := time.Duration(chunkLength/1024) * time.Second
+		sizeBasedTimeout := time.Duration(chunkLen/1024) * time.Second
 		timeout = baseTimeout + sizeBasedTimeout
 
 		if timeout < 30*time.Second {
@@ -256,8 +255,6 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 	}
 
 	// Create a fresh context for each chunk read with calculated timeout
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 
 	if cfg.Debug && job.Index%10000 == 0 {
 		fmt.Fprintf(os.Stderr, "\nWorker %d: Processing chunk %d from %s (offset: %d, length: %d, timeout: %v)\n",
@@ -294,7 +291,7 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 	}
 
 	if err := iter.Err(); err != nil {
-		return points, fmt.Errorf("iterator error in %s: %w", chunkFileName, err)
+		return points, info, fmt.Errorf("iterator error in %s: %w", chunkFileName, err)
 	}
 
 	if cfg.Debug && len(points) > 0 && job.Index%10000 == 0 {

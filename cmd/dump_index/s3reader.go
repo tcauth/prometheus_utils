@@ -188,6 +188,7 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 			pieceData, exists := r.cache[cacheKey]
 			r.mu.RUnlock()
 			if !exists {
+				var found bool
 				pieceData, found = r.readChunkPieceFromLocalCache(pieceStart, pieceLength)
 				if !found {
 					rangeHeader := fmt.Sprintf("bytes=%d-%d", pieceStart, pieceStart+pieceLength-1)

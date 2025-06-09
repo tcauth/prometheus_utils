@@ -32,8 +32,6 @@ type OptimizedS3Reader struct {
 	useFullData    bool
 	mu             sync.RWMutex
 	totalRequested int64
-	requestCount   int
-	threshold      float64
 	localCacheDir  string
 	fileType       string
 	indexRanges    map[int64][]byte // For accumulating index ranges
@@ -71,7 +69,6 @@ func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug 
 				cache:         make(map[string][]byte),
 				debug:         debug,
 				useFullData:   false,
-				threshold:     0.3,
 				localCacheDir: cacheDir,
 				fileType:      fileType,
 				indexRanges:   make(map[int64][]byte),
@@ -97,7 +94,6 @@ func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug 
 		cache:         make(map[string][]byte),
 		debug:         debug,
 		useFullData:   false,
-		threshold:     0.3,
 		localCacheDir: cacheDir,
 		fileType:      fileType,
 		indexRanges:   make(map[int64][]byte),
@@ -151,31 +147,7 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 		}
 	}
 
-	// Check if we should switch to full download for index files
-	r.mu.Lock()
-	requestedDataRatio := float64(r.totalRequested) / float64(r.size)
-	shouldSwitchToFull := requestedDataRatio > r.threshold || r.requestCount > 15
-	r.mu.Unlock()
-
-	if shouldSwitchToFull && !r.useFullData && r.fileType == "index" {
-		if r.debug {
-			fmt.Fprintf(os.Stderr, "Switching to full download: %.1f%% of file requested in %d requests\n",
-				requestedDataRatio*100, r.requestCount)
-		}
-
-		if err := r.downloadParallel(50 * 1024 * 1024); err != nil {
-			if r.debug {
-				fmt.Fprintf(os.Stderr, "Failed to download full file, continuing with range requests: %v\n", err)
-			}
-		} else {
-			if r.localCacheDir != "" && r.fileType == "index" {
-				r.saveIndexToLocalCache()
-			}
-			requestedLength := end - off + 1
-			copy(p, r.data[off:off+requestedLength])
-			return int(requestedLength), nil
-		}
-	}
+	// All reads rely on the piece-based cache mechanism; we don't switch to full downloads
 
 	// Continue with range requests
 	if r.fileType == "chunks" {
@@ -226,7 +198,6 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	optimizedCacheKey := fmt.Sprintf("%d-%d", rangeStart, rangeEnd)
 	r.cache[optimizedCacheKey] = data
 	r.totalRequested += int64(len(data))
-	r.requestCount++
 	r.mu.Unlock()
 
 	requestedOffset := off - rangeStart
@@ -431,7 +402,6 @@ func (r *OptimizedS3Reader) downloadPiecesParallel(ctx context.Context, p []byte
 				r.mu.Lock()
 				r.cache[cacheKey] = data
 				r.totalRequested += int64(len(data))
-				r.requestCount++
 				r.mu.Unlock()
 			}
 

@@ -296,6 +296,7 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 
 		points = append(points, SeriesPoint{
 			SeriesLabels: labelsStr,
+			Labels:       job.ChunkInfo.SeriesLabel,
 			Timestamp:    ts,
 			Value:        val,
 		})

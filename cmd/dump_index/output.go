@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -50,7 +51,7 @@ func outputResults(points []SeriesPoint, cfg Config, bucket, tenant, blockID str
 
 	switch cfg.OutputFormat {
 	case "csv":
-		err = outputCSV(f, points)
+		err = outputCSV(f, points, cfg)
 	case "json":
 		err = outputJSON(f, points)
 	case "prometheus":
@@ -66,20 +67,49 @@ func outputResults(points []SeriesPoint, cfg Config, bucket, tenant, blockID str
 	return err
 }
 
-func outputCSV(w io.Writer, points []SeriesPoint) error {
+func outputCSV(w io.Writer, points []SeriesPoint, cfg Config) error {
 	writer := csv.NewWriter(w)
 	defer writer.Flush()
 
-	if err := writer.Write([]string{"series_labels", "timestamp", "value"}); err != nil {
+	if cfg.OutputLabels == "" {
+		if err := writer.Write([]string{"series_labels", "timestamp", "value"}); err != nil {
+			return fmt.Errorf("failed to write CSV header: %w", err)
+		}
+
+		for _, point := range points {
+			record := []string{
+				point.SeriesLabels,
+				strconv.FormatInt(point.Timestamp, 10),
+				strconv.FormatFloat(point.Value, 'f', -1, 64),
+			}
+			if err := writer.Write(record); err != nil {
+				return fmt.Errorf("failed to write CSV record: %w", err)
+			}
+		}
+		return nil
+	}
+
+	labelNames := []string{"__name__"}
+	for _, l := range strings.Split(cfg.OutputLabels, ",") {
+		name := strings.TrimSpace(l)
+		if name == "" || name == "__name__" {
+			continue
+		}
+		labelNames = append(labelNames, name)
+	}
+
+	header := append(labelNames, "timestamp", "value")
+	if err := writer.Write(header); err != nil {
 		return fmt.Errorf("failed to write CSV header: %w", err)
 	}
 
 	for _, point := range points {
-		record := []string{
-			point.SeriesLabels,
-			strconv.FormatInt(point.Timestamp, 10),
-			strconv.FormatFloat(point.Value, 'f', -1, 64),
+		record := make([]string, len(labelNames)+2)
+		for i, name := range labelNames {
+			record[i] = point.Labels.Get(name)
 		}
+		record[len(labelNames)] = strconv.FormatInt(point.Timestamp, 10)
+		record[len(labelNames)+1] = strconv.FormatFloat(point.Value, 'f', -1, 64)
 		if err := writer.Write(record); err != nil {
 			return fmt.Errorf("failed to write CSV record: %w", err)
 		}

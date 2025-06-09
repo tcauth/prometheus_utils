@@ -24,10 +24,12 @@ type Config struct {
 	SwitchThreshold    float64
 	DumpChunkTable     bool
 	OutputFilename     string
+	OutputLabels       string
 }
 
 type SeriesPoint struct {
 	SeriesLabels string
+	Labels       labels.Labels
 	Timestamp    int64
 	Value        float64
 }

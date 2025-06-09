@@ -41,6 +41,7 @@ type Config struct {
 	EndTime            int64
 	OutputFormat       string
 	SwitchThreshold    float64
+	DumpChunkTable     bool
 }
 
 type SeriesPoint struct {
@@ -49,17 +50,24 @@ type SeriesPoint struct {
 	Value        float64
 }
 
+type ChunkInfo struct {
+	ChunkRef     chunks.Meta
+	SeriesLabel  labels.Labels
+	ChunkFileNum int
+	ChunkOffset  uint64
+	ChunkLength  uint32
+}
+
 type ChunkJob struct {
 	Index       int
-	ChunkRef    chunks.Meta
-	SeriesLabel labels.Labels
+	ChunkInfo   ChunkInfo
 }
 
 type ChunkResult struct {
-	Points   []SeriesPoint
-	Error    error
-	Index    int
-	ChunkRef chunks.Meta
+	Points    []SeriesPoint
+	Error     error
+	Index     int
+	ChunkInfo ChunkInfo
 }
 
 type OptimizedS3Reader struct {
@@ -750,6 +758,7 @@ func main() {
 	flag.Int64Var(&cfg.EndTime, "end-time", 0, "End time (Unix timestamp in milliseconds, optional)")
 	flag.StringVar(&cfg.OutputFormat, "output", "csv", "Output format: csv, json, or prometheus")
 	flag.Float64Var(&cfg.SwitchThreshold, "switch-threshold", 0.2, "Switch to full download when this fraction of index file is requested (0.1-0.9, default: 0.2)")
+	flag.BoolVar(&cfg.DumpChunkTable, "dump-chunk-table", false, "Dump chunk table (chunk file, offset, size) as CSV instead of time series data")
 	flag.Parse()
 
 	if cfg.BlockPath == "" {
@@ -890,83 +899,95 @@ func dumpSeries(cfg Config) error {
 
 	// Get chunk locations from index
 	fmt.Fprintf(os.Stderr, "Reading chunk locations from index...\n")
-	chunkRefs, seriesLabels, err := getChunkReferences(*idx, cfg)
+	chunkInfos, err := getChunkReferences(*idx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to get chunk references: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Found %d chunks for %d series\n", len(chunkRefs), len(seriesLabels))
+	// Analyze chunk distribution across files
+	chunkFileStats := make(map[int]int)
+	for _, chunkInfo := range chunkInfos {
+		chunkFileStats[chunkInfo.ChunkFileNum]++
+	}
 
-	// Read chunks file to get actual data (DON'T download the entire file)
-	chunksKey := path.Join(tenant, blockID, "chunks", "000001")
-	chunkFileName := fmt.Sprintf("%s/chunks/000001", blockID)
+	fmt.Fprintf(os.Stderr, "Found %d chunks distributed across chunk files:\n", len(chunkInfos))
+	for fileNum, count := range chunkFileStats {
+		fmt.Fprintf(os.Stderr, "  chunks/%06d: %d chunks\n", fileNum, count)
+	}
+
+	// If dump-chunk-table is requested, output the table and exit
+	if cfg.DumpChunkTable {
+		return outputChunkTable(chunkInfos)
+	}
+
+	// Group chunks by file for processing
+	chunksByFile := make(map[int][]ChunkInfo)
+	for _, chunkInfo := range chunkInfos {
+		chunksByFile[chunkInfo.ChunkFileNum] = append(chunksByFile[chunkInfo.ChunkFileNum], chunkInfo)
+	}
+
+	var allPoints []SeriesPoint
 	
-	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "Setting up chunks reader for s3://%s/%s (chunk file: %s)\n", bucket, chunksKey, chunkFileName)
+	// Process each chunk file
+	for fileNum, fileChunks := range chunksByFile {
+		chunkFileName := fmt.Sprintf("%s/chunks/%06d", blockID, fileNum)
+		chunksKey := path.Join(tenant, blockID, "chunks", fmt.Sprintf("%06d", fileNum))
+		
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "Setting up chunks reader for s3://%s/%s (chunk file: %s, %d chunks)\n", 
+				bucket, chunksKey, chunkFileName, len(fileChunks))
+		}
+		
+		chunkCacheDir := ""
 		if cfg.WorkingDir != "" {
-			fmt.Fprintf(os.Stderr, "Using working directory for caching: %s\n", cfg.WorkingDir)
+			chunkCacheDir = cfg.WorkingDir
 		}
-	}
-	
-	chunkCacheDir := ""
-	if cfg.WorkingDir != "" {
-		chunkCacheDir = cfg.WorkingDir
-	}
-	
-	chunksReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
-	if err != nil {
-		return fmt.Errorf("failed to create chunks reader: %w", err)
-	}
-
-	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "Chunks file size: %d bytes (%.2f GB)\n", 
-			chunksReader.Size(), float64(chunksReader.Size())/(1024*1024*1024))
-		if cfg.ChunkTimeout > 0 {
-			fmt.Fprintf(os.Stderr, "Using fixed chunk timeout: %d seconds\n", cfg.ChunkTimeout)
-		} else {
-			fmt.Fprintf(os.Stderr, "Using adaptive chunk timeout: 30s base + 1s per KB chunk size (max 5min)\n")
+		
+		chunksReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
+		if err != nil {
+			return fmt.Errorf("failed to create chunks reader for file %06d: %w", fileNum, err)
 		}
-		fmt.Fprintf(os.Stderr, "Will process chunks using %d parallel workers with targeted range requests\n", cfg.ChunkWorkers)
+
+		fmt.Fprintf(os.Stderr, "Reading time series data from %s (%d chunks)...\n", chunkFileName, len(fileChunks))
+		points, err := readChunkData(chunksReader, fileChunks, cfg, chunkFileName)
+		if err != nil {
+			return fmt.Errorf("failed to read chunk data from %s: %w", chunkFileName, err)
+		}
+
+		allPoints = append(allPoints, points...)
 	}
 
-	fmt.Fprintf(os.Stderr, "Reading time series data from %s...\n", chunkFileName)
-	points, err := readChunkData(chunksReader, chunkRefs, seriesLabels, cfg, chunkFileName)
-	if err != nil {
-		return fmt.Errorf("failed to read chunk data: %w", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "Extracted %d data points\n", len(points))
+	fmt.Fprintf(os.Stderr, "Extracted %d data points from %d chunk files\n", len(allPoints), len(chunksByFile))
 
 	// Output results
-	return outputResults(points, cfg)
+	return outputResults(allPoints, cfg)
 }
 
-func getChunkReferences(idx index.Reader, cfg Config) ([]chunks.Meta, []labels.Labels, error) {
+func getChunkReferences(idx index.Reader, cfg Config) ([]ChunkInfo, error) {
 	var postings index.Postings
 	var err error
 
 	if cfg.MetricName != "" {
 		postings, err = idx.Postings(labels.MetricName, cfg.MetricName)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to get postings for metric %s: %w", cfg.MetricName, err)
+			return nil, fmt.Errorf("failed to get postings for metric %s: %w", cfg.MetricName, err)
 		}
 	} else {
 		postings, err = idx.Postings(index.AllPostingsKey())
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to get all postings: %w", err)
+			return nil, fmt.Errorf("failed to get all postings: %w", err)
 		}
 	}
 
 	if cfg.LabelKey != "" && cfg.LabelValue != "" {
 		labelPostings, err := idx.Postings(cfg.LabelKey, cfg.LabelValue)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to get postings for label %s=%s: %w", cfg.LabelKey, cfg.LabelValue, err)
+			return nil, fmt.Errorf("failed to get postings for label %s=%s: %w", cfg.LabelKey, cfg.LabelValue, err)
 		}
 		postings = index.Intersect(postings, labelPostings)
 	}
 
-	var allChunks []chunks.Meta
-	var allLabels []labels.Labels
+	var allChunkInfos []ChunkInfo
 	var lbls labels.Labels
 	var chks []chunks.Meta
 
@@ -975,7 +996,7 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]chunks.Meta, []labels.L
 		
 		var builder labels.ScratchBuilder
 		if err := idx.Series(seriesID, &builder, &chks); err != nil {
-			return nil, nil, fmt.Errorf("failed to get series %d: %w", seriesID, err)
+			return nil, fmt.Errorf("failed to get series %d: %w", seriesID, err)
 		}
 		
 		lbls = builder.Labels()
@@ -989,23 +1010,63 @@ func getChunkReferences(idx index.Reader, cfg Config) ([]chunks.Meta, []labels.L
 				continue
 			}
 			
-			allChunks = append(allChunks, chk)
-			allLabels = append(allLabels, lbls)
+			// Parse chunk reference to extract file number, offset, and length
+			// TSDB chunk reference format: [8 bits: file_num][32 bits: offset][24 bits: length]
+			chunkRef := uint64(chk.Ref)
+			chunkFileNum := int((chunkRef >> 56) & 0xFF)        // Top 8 bits
+			chunkOffset := (chunkRef >> 24) & 0xFFFFFFFF        // Next 32 bits  
+			chunkLength := uint32(chunkRef & 0xFFFFFF)          // Bottom 24 bits
+			
+			allChunkInfos = append(allChunkInfos, ChunkInfo{
+				ChunkRef:     chk,
+				SeriesLabel:  lbls,
+				ChunkFileNum: chunkFileNum,
+				ChunkOffset:  chunkOffset,
+				ChunkLength:  chunkLength,
+			})
 		}
 	}
 
-	return allChunks, allLabels, postings.Err()
+	return allChunkInfos, postings.Err()
 }
 
-func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, seriesLabels []labels.Labels, cfg Config, chunkFileName string) ([]SeriesPoint, error) {
+func outputChunkTable(chunkInfos []ChunkInfo) error {
+	writer := csv.NewWriter(os.Stdout)
+	defer writer.Flush()
+
+	// Write header
+	if err := writer.Write([]string{"series_labels", "chunk_file", "chunk_offset", "chunk_length", "min_time", "max_time"}); err != nil {
+		return fmt.Errorf("failed to write chunk table header: %w", err)
+	}
+
+	// Write chunk data
+	for _, chunkInfo := range chunkInfos {
+		record := []string{
+			chunkInfo.SeriesLabel.String(),
+			fmt.Sprintf("%06d", chunkInfo.ChunkFileNum),
+			strconv.FormatUint(chunkInfo.ChunkOffset, 10),
+			strconv.FormatUint(uint64(chunkInfo.ChunkLength), 10),
+			strconv.FormatInt(chunkInfo.ChunkRef.MinTime, 10),
+			strconv.FormatInt(chunkInfo.ChunkRef.MaxTime, 10),
+		}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write chunk table record: %w", err)
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "Dumped chunk table with %d entries\n", len(chunkInfos))
+	return nil
+}
+
+func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg Config, chunkFileName string) ([]SeriesPoint, error) {
 	var allPoints []SeriesPoint
 	startTime := time.Now()
 
-	fmt.Fprintf(os.Stderr, "Processing %d chunks from %s using %d parallel workers...\n", len(chunkRefs), chunkFileName, cfg.ChunkWorkers)
+	fmt.Fprintf(os.Stderr, "Processing %d chunks from %s using %d parallel workers...\n", len(chunkInfos), chunkFileName, cfg.ChunkWorkers)
 
 	// Create job and result channels
-	jobs := make(chan ChunkJob, len(chunkRefs))
-	results := make(chan ChunkResult, len(chunkRefs))
+	jobs := make(chan ChunkJob, len(chunkInfos))
+	results := make(chan ChunkResult, len(chunkInfos))
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -1019,11 +1080,10 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 
 	// Send jobs to workers
 	go func() {
-		for i, chkMeta := range chunkRefs {
+		for i, chunkInfo := range chunkInfos {
 			jobs <- ChunkJob{
-				Index:       i,
-				ChunkRef:    chkMeta,
-				SeriesLabel: seriesLabels[i],
+				Index:     i,
+				ChunkInfo: chunkInfo,
 			}
 		}
 		close(jobs)
@@ -1044,10 +1104,8 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 		processed++
 		
 		if result.Error != nil {
-			chunkOffset := uint64(result.ChunkRef.Ref) >> 32
-			chunkLength := uint32(result.ChunkRef.Ref)
 			fmt.Fprintf(os.Stderr, "\nWarning: chunk %d/%d from %s (offset: %d, length: %d) failed: %v\n", 
-				result.Index+1, len(chunkRefs), chunkFileName, chunkOffset, chunkLength, result.Error)
+				result.Index+1, len(chunkInfos), chunkFileName, result.ChunkInfo.ChunkOffset, result.ChunkInfo.ChunkLength, result.Error)
 		} else {
 			allPoints = append(allPoints, result.Points...)
 			totalPoints += len(result.Points)
@@ -1057,11 +1115,11 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 		if processed%1000 == 0 || time.Since(lastProgressTime) > 10*time.Second {
 			elapsed := time.Since(startTime)
 			rate := float64(processed) / elapsed.Seconds()
-			remaining := time.Duration(float64(len(chunkRefs)-processed)/rate) * time.Second
-			progress := float64(processed) / float64(len(chunkRefs)) * 100
+			remaining := time.Duration(float64(len(chunkInfos)-processed)/rate) * time.Second
+			progress := float64(processed) / float64(len(chunkInfos)) * 100
 			
 			fmt.Fprintf(os.Stderr, "\rChunk progress: %d/%d (%.1f%%) - Rate: %.0f chunks/sec - ETA: %v - Points: %d", 
-				processed, len(chunkRefs), progress, rate, remaining, totalPoints)
+				processed, len(chunkInfos), progress, rate, remaining, totalPoints)
 			lastProgressTime = time.Now()
 		}
 	}
@@ -1069,7 +1127,7 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkRefs []chunks.Meta, ser
 	// Clear progress line and show final stats
 	elapsed := time.Since(startTime)
 	fmt.Fprintf(os.Stderr, "\rCompleted processing %d chunks from %s in %v using %d workers - Extracted %d data points                    \n", 
-		len(chunkRefs), chunkFileName, elapsed, cfg.ChunkWorkers, len(allPoints))
+		len(chunkInfos), chunkFileName, elapsed, cfg.ChunkWorkers, len(allPoints))
 
 	return allPoints, nil
 }
@@ -1078,18 +1136,18 @@ func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResul
 	for job := range jobs {
 		points, err := processOneChunk(job, chunksReader, cfg, workerID, chunkFileName)
 		results <- ChunkResult{
-			Points:   points,
-			Error:    err,
-			Index:    job.Index,
-			ChunkRef: job.ChunkRef,
+			Points:    points,
+			Error:     err,
+			Index:     job.Index,
+			ChunkInfo: job.ChunkInfo,
 		}
 	}
 }
 
 func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, workerID int, chunkFileName string) ([]SeriesPoint, error) {
-	// Read chunk data using the reference offset
-	chunkOffset := uint64(job.ChunkRef.Ref) >> 32 // Higher 32 bits are offset
-	chunkLength := uint32(job.ChunkRef.Ref)       // Lower 32 bits are length
+	// Read chunk data using the ChunkInfo offset and length
+	chunkOffset := job.ChunkInfo.ChunkOffset
+	chunkLength := job.ChunkInfo.ChunkLength
 
 	if chunkLength == 0 {
 		return nil, fmt.Errorf("chunk has zero length")
@@ -1144,7 +1202,7 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 
 	// Extract time series points
 	iter := chunk.Iterator(nil)
-	labelsStr := job.SeriesLabel.String()
+	labelsStr := job.ChunkInfo.SeriesLabel.String()
 	var points []SeriesPoint
 
 	for iter.Next() == chunkenc.ValFloat {

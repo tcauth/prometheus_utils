@@ -15,6 +15,11 @@ import (
 	"github.com/prometheus/prometheus/tsdb/index"
 )
 
+const (
+	chunkPieceSize   int64 = 16 * 1024 * 1024
+	pieceWorkerLimit       = 20
+)
+
 type OptimizedS3Reader struct {
 	client         *s3.Client
 	bucket         string
@@ -173,57 +178,7 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 
 	// Continue with range requests
 	if r.fileType == "chunks" {
-		const pieceSize int64 = 16 * 1024 * 1024
-		bytesRead := 0
-		cur := off
-		for cur <= end {
-			pieceStart := (cur / pieceSize) * pieceSize
-			pieceLength := pieceSize
-			if pieceStart+pieceLength > r.size {
-				pieceLength = r.size - pieceStart
-			}
-
-			cacheKey := fmt.Sprintf("%d-%d", pieceStart, pieceStart+pieceLength-1)
-			r.mu.RLock()
-			pieceData, exists := r.cache[cacheKey]
-			r.mu.RUnlock()
-			if !exists {
-				var found bool
-				pieceData, found = r.readChunkPieceFromLocalCache(pieceStart, pieceLength)
-				if !found {
-					rangeHeader := fmt.Sprintf("bytes=%d-%d", pieceStart, pieceStart+pieceLength-1)
-					resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
-						Bucket: aws.String(r.bucket),
-						Key:    aws.String(r.key),
-						Range:  aws.String(rangeHeader),
-					})
-					if err != nil {
-						return 0, fmt.Errorf("failed to read range %s: %w", rangeHeader, err)
-					}
-					pieceData, err = io.ReadAll(resp.Body)
-					resp.Body.Close()
-					if err != nil {
-						return 0, fmt.Errorf("failed to read response body: %w", err)
-					}
-					r.saveChunkPieceToLocalCache(pieceStart, pieceData)
-				}
-				r.mu.Lock()
-				r.cache[cacheKey] = pieceData
-				r.totalRequested += int64(len(pieceData))
-				r.requestCount++
-				r.mu.Unlock()
-			}
-
-			copyStart := cur - pieceStart
-			copyLen := int64(len(pieceData)) - copyStart
-			if cur+copyLen-1 > end {
-				copyLen = end - cur + 1
-			}
-			copy(p[bytesRead:bytesRead+int(copyLen)], pieceData[copyStart:copyStart+copyLen])
-			bytesRead += int(copyLen)
-			cur += copyLen
-		}
-		return bytesRead, nil
+		return r.downloadChunkPiecesParallel(ctx, p, off, end)
 	}
 
 	r.mu.RLock()
@@ -414,6 +369,110 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 	return nil
 }
 
+func (r *OptimizedS3Reader) downloadChunkPiecesParallel(ctx context.Context, p []byte, off, end int64) (int, error) {
+	type piece struct {
+		start  int64
+		length int64
+		data   []byte
+	}
+
+	var pieces []piece
+	for pieceStart := (off / chunkPieceSize) * chunkPieceSize; pieceStart <= end; pieceStart += chunkPieceSize {
+		pieceLength := chunkPieceSize
+		if pieceStart+pieceLength > r.size {
+			pieceLength = r.size - pieceStart
+		}
+		pieces = append(pieces, piece{start: pieceStart, length: pieceLength})
+	}
+
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, pieceWorkerLimit)
+	errChan := make(chan error, len(pieces))
+
+	for i := range pieces {
+		wg.Add(1)
+		go func(pc *piece) {
+			defer wg.Done()
+
+			cacheKey := fmt.Sprintf("%d-%d", pc.start, pc.start+pc.length-1)
+			r.mu.RLock()
+			data, exists := r.cache[cacheKey]
+			r.mu.RUnlock()
+
+			if !exists {
+				var found bool
+				data, found = r.readChunkPieceFromLocalCache(pc.start, pc.length)
+				if !found {
+					semaphore <- struct{}{}
+					rangeHeader := fmt.Sprintf("bytes=%d-%d", pc.start, pc.start+pc.length-1)
+					resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
+						Bucket: aws.String(r.bucket),
+						Key:    aws.String(r.key),
+						Range:  aws.String(rangeHeader),
+					})
+					if err != nil {
+						<-semaphore
+						errChan <- fmt.Errorf("failed to read range %s: %w", rangeHeader, err)
+						return
+					}
+					data, err = io.ReadAll(resp.Body)
+					resp.Body.Close()
+					<-semaphore
+					if err != nil {
+						errChan <- fmt.Errorf("failed to read response body: %w", err)
+						return
+					}
+					r.saveChunkPieceToLocalCache(pc.start, data)
+				}
+				r.mu.Lock()
+				r.cache[cacheKey] = data
+				r.totalRequested += int64(len(data))
+				r.requestCount++
+				r.mu.Unlock()
+			}
+
+			pc.data = data
+		}(&pieces[i])
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	bytesRead := 0
+	cur := off
+	for cur <= end {
+		pieceStart := (cur / chunkPieceSize) * chunkPieceSize
+		var pcData []byte
+		for _, pc := range pieces {
+			if pc.start == pieceStart {
+				pcData = pc.data
+				break
+			}
+		}
+
+		if pcData == nil {
+			return bytesRead, fmt.Errorf("missing piece data for offset %d", pieceStart)
+		}
+
+		copyStart := cur - pieceStart
+		copyLen := int64(len(pcData)) - copyStart
+		if cur+copyLen-1 > end {
+			copyLen = end - cur + 1
+		}
+		copy(p[bytesRead:bytesRead+int(copyLen)], pcData[copyStart:copyStart+copyLen])
+		bytesRead += int(copyLen)
+		cur += copyLen
+	}
+
+	return bytesRead, nil
+}
+
 func (r *OptimizedS3Reader) Len() int {
 	return int(r.size)
 }
@@ -537,7 +596,7 @@ func (r *OptimizedS3Reader) saveIndexToLocalCache() {
 }
 
 func (r *OptimizedS3Reader) readChunkFromLocalCache(offset int64, length int64) ([]byte, bool) {
-	const pieceSize int64 = 16 * 1024 * 1024
+	const pieceSize int64 = chunkPieceSize
 	if r.localCacheDir == "" {
 		return nil, false
 	}

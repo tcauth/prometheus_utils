@@ -77,6 +77,7 @@ type OptimizedS3Reader struct {
 	threshold      float64
 	localCacheDir  string
 	fileType       string
+	indexRanges    map[int64][]byte // For accumulating index ranges
 }
 
 func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*OptimizedS3Reader, error) {
@@ -103,6 +104,7 @@ func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug 
 		threshold:     0.3,
 		localCacheDir: cacheDir,
 		fileType:      fileType,
+		indexRanges:   make(map[int64][]byte),
 	}, nil
 }
 
@@ -129,11 +131,27 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	}
 
 	// Check local cache first if caching is enabled
-	if r.localCacheDir != "" && r.fileType == "chunks" {
-		cachedData, found := r.readFromLocalCache(off, end-off+1)
-		if found {
-			copy(p, cachedData)
-			return len(cachedData), nil
+	if r.localCacheDir != "" {
+		if r.fileType == "index" {
+			// For index files, check if we have the complete file cached
+			cachedData, found := r.readFromLocalCache(0, r.size)
+			if found {
+				r.data = cachedData
+				r.useFullData = true
+				if r.debug {
+					fmt.Fprintf(os.Stderr, "Loaded complete index from cache\n")
+				}
+				requestedLength := end - off + 1
+				copy(p, r.data[off:off+requestedLength])
+				return int(requestedLength), nil
+			}
+		} else if r.fileType == "chunks" {
+			// For chunk files, check specific range cache
+			cachedData, found := r.readFromLocalCache(off, end-off+1)
+			if found {
+				copy(p, cachedData)
+				return len(cachedData), nil
+			}
 		}
 	}
 
@@ -197,9 +215,14 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 		return 0, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Save to local cache if enabled and this is a chunk
-	if r.localCacheDir != "" && r.fileType == "chunks" {
-		r.saveChunkToLocalCache(optimizedStart, data)
+	// Save to local cache if enabled
+	if r.localCacheDir != "" {
+		if r.fileType == "chunks" {
+			r.saveChunkToLocalCache(optimizedStart, data)
+		} else if r.fileType == "index" {
+			// For index files, accumulate range data and save when we have enough
+			r.saveIndexRangeToLocalCache(optimizedStart, data)
+		}
 	}
 
 	// Update statistics and cache
@@ -466,6 +489,86 @@ func (r *OptimizedS3Reader) saveChunkToLocalCache(offset int64, data []byte) {
 		}
 	} else if r.debug {
 		fmt.Fprintf(os.Stderr, "Cached chunk to: %s\n", chunkFile)
+	}
+}
+
+func (r *OptimizedS3Reader) saveIndexRangeToLocalCache(offset int64, data []byte) {
+	if r.localCacheDir == "" {
+		return
+	}
+
+	// Accumulate index ranges in memory
+	r.indexRanges[offset] = data
+	
+	// Check if we should try to reconstruct the full index
+	// This is a simple heuristic - if we have enough data, try to reconstruct
+	totalCachedBytes := int64(0)
+	for _, rangeData := range r.indexRanges {
+		totalCachedBytes += int64(len(rangeData))
+	}
+	
+	// If we have >= 90% of the file in ranges, reconstruct and cache the full index
+	if float64(totalCachedBytes) >= float64(r.size)*0.9 {
+		r.reconstructAndCacheIndex()
+	}
+}
+
+func (r *OptimizedS3Reader) reconstructAndCacheIndex() {
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "Attempting to reconstruct full index from %d cached ranges...\n", len(r.indexRanges))
+	}
+
+	// Create a map of all byte positions we have
+	reconstructed := make([]byte, r.size)
+	covered := make([]bool, r.size)
+	
+	for offset, data := range r.indexRanges {
+		if offset+int64(len(data)) <= r.size {
+			copy(reconstructed[offset:offset+int64(len(data))], data)
+			for i := offset; i < offset+int64(len(data)); i++ {
+				covered[i] = true
+			}
+		}
+	}
+	
+	// Check how much we have covered
+	coveredBytes := int64(0)
+	for _, isCovered := range covered {
+		if isCovered {
+			coveredBytes++
+		}
+	}
+	
+	coverage := float64(coveredBytes) / float64(r.size)
+	if r.debug {
+		fmt.Fprintf(os.Stderr, "Index reconstruction coverage: %.1f%% (%d/%d bytes)\n", 
+			coverage*100, coveredBytes, r.size)
+	}
+	
+	// If we have good coverage (>=95%), save the index
+	if coverage >= 0.95 {
+		indexPath := filepath.Join(r.localCacheDir, r.bucket, strings.ReplaceAll(r.key, "/", string(filepath.Separator)), "index")
+		if err := os.MkdirAll(filepath.Dir(indexPath), 0755); err != nil {
+			if r.debug {
+				fmt.Fprintf(os.Stderr, "Failed to create index cache directory: %v\n", err)
+			}
+			return
+		}
+		
+		if err := os.WriteFile(indexPath, reconstructed, 0644); err != nil {
+			if r.debug {
+				fmt.Fprintf(os.Stderr, "Failed to cache reconstructed index: %v\n", err)
+			}
+		} else if r.debug {
+			fmt.Fprintf(os.Stderr, "Successfully cached reconstructed index to: %s\n", indexPath)
+		}
+		
+		// Also update our in-memory data for immediate use
+		r.data = reconstructed
+		r.useFullData = true
+		
+		// Clear the ranges map to save memory
+		r.indexRanges = make(map[int64][]byte)
 	}
 }
 

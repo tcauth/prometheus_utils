@@ -17,6 +17,7 @@ import (
 
 const (
 	chunkPieceSize   int64 = 16 * 1024 * 1024
+	indexPieceSize   int64 = 64 * 1024 * 1024
 	pieceWorkerLimit       = 20
 )
 
@@ -181,6 +182,10 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 		return r.downloadChunkPiecesParallel(ctx, p, off, end)
 	}
 
+	if r.fileType == "index" {
+		return r.downloadIndexPiecesParallel(ctx, p, off, end)
+	}
+
 	r.mu.RLock()
 	cacheKey := fmt.Sprintf("%d-%d", off, end)
 	if data, exists := r.cache[cacheKey]; exists {
@@ -190,7 +195,6 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 	}
 	r.mu.RUnlock()
 
-	// For index, use larger range optimization - 256KB instead of 64KB
 	rangeStart := (off / 262144) * 262144
 	rangeEnd := ((end/262144)+1)*262144 - 1
 	if rangeEnd >= r.size {
@@ -369,7 +373,7 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 	return nil
 }
 
-func (r *OptimizedS3Reader) downloadChunkPiecesParallel(ctx context.Context, p []byte, off, end int64) (int, error) {
+func (r *OptimizedS3Reader) downloadPiecesParallel(ctx context.Context, p []byte, off, end, pieceSize int64) (int, error) {
 	type piece struct {
 		start  int64
 		length int64
@@ -377,8 +381,8 @@ func (r *OptimizedS3Reader) downloadChunkPiecesParallel(ctx context.Context, p [
 	}
 
 	var pieces []piece
-	for pieceStart := (off / chunkPieceSize) * chunkPieceSize; pieceStart <= end; pieceStart += chunkPieceSize {
-		pieceLength := chunkPieceSize
+	for pieceStart := (off / pieceSize) * pieceSize; pieceStart <= end; pieceStart += pieceSize {
+		pieceLength := pieceSize
 		if pieceStart+pieceLength > r.size {
 			pieceLength = r.size - pieceStart
 		}
@@ -447,7 +451,7 @@ func (r *OptimizedS3Reader) downloadChunkPiecesParallel(ctx context.Context, p [
 	bytesRead := 0
 	cur := off
 	for cur <= end {
-		pieceStart := (cur / chunkPieceSize) * chunkPieceSize
+		pieceStart := (cur / pieceSize) * pieceSize
 		var pcData []byte
 		for _, pc := range pieces {
 			if pc.start == pieceStart {
@@ -471,6 +475,14 @@ func (r *OptimizedS3Reader) downloadChunkPiecesParallel(ctx context.Context, p [
 	}
 
 	return bytesRead, nil
+}
+
+func (r *OptimizedS3Reader) downloadChunkPiecesParallel(ctx context.Context, p []byte, off, end int64) (int, error) {
+	return r.downloadPiecesParallel(ctx, p, off, end, chunkPieceSize)
+}
+
+func (r *OptimizedS3Reader) downloadIndexPiecesParallel(ctx context.Context, p []byte, off, end int64) (int, error) {
+	return r.downloadPiecesParallel(ctx, p, off, end, indexPieceSize)
 }
 
 func (r *OptimizedS3Reader) Len() int {

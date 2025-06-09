@@ -147,8 +147,8 @@ func outputChunkTable(chunkInfos []ChunkInfo, s3Client *s3.Client, bucket, tenan
 	return nil
 }
 
-func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg Config, chunkFileName string) ([]SeriesPoint, error) {
-	var allPoints []SeriesPoint
+func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg Config, chunkFileName string, writer streamWriter) error {
+	totalPointsWritten := 0
 	startTime := time.Now()
 
 	fmt.Fprintf(os.Stderr, "Processing %d chunks from %s using %d parallel workers...\n", len(chunkInfos), chunkFileName, cfg.ChunkWorkers)
@@ -196,8 +196,11 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg 
 			fmt.Fprintf(os.Stderr, "\nWarning: chunk %d/%d from %s (offset: %d, length: %d) failed: %v\n",
 				result.Index+1, len(chunkInfos), chunkFileName, result.ChunkInfo.ChunkOffset, result.ChunkInfo.ChunkLength, result.Error)
 		} else {
-			allPoints = append(allPoints, result.Points...)
+			if err := writer.WritePoints(result.Points); err != nil {
+				return err
+			}
 			totalPoints += len(result.Points)
+			totalPointsWritten += len(result.Points)
 		}
 
 		// Show progress every 1000 chunks or every 10 seconds
@@ -216,9 +219,9 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg 
 	// Clear progress line and show final stats
 	elapsed := time.Since(startTime)
 	fmt.Fprintf(os.Stderr, "\rCompleted processing %d chunks from %s in %v using %d workers - Extracted %d data points                    \n",
-		len(chunkInfos), chunkFileName, elapsed, cfg.ChunkWorkers, len(allPoints))
+		len(chunkInfos), chunkFileName, elapsed, cfg.ChunkWorkers, totalPointsWritten)
 
-	return allPoints, nil
+	return nil
 }
 
 func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResult, chunksReader *OptimizedS3Reader, cfg Config, chunkFileName string) {

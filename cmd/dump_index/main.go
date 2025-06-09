@@ -188,7 +188,15 @@ func dumpSeries(cfg Config) error {
 		chunksByFile[chunkInfo.ChunkFileNum] = append(chunksByFile[chunkInfo.ChunkFileNum], chunkInfo)
 	}
 
-	var allPoints []SeriesPoint
+	writer, outputPath, err := newStreamWriter(cfg, bucket, tenant, blockID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := writer.Close(); err == nil {
+			fmt.Fprintf(os.Stderr, "Saved output to %s\n", outputPath)
+		}
+	}()
 
 	for fileNum, fileChunks := range chunksByFile {
 		chunkFileName := fmt.Sprintf("%s/chunks/%06d", blockID, fileNum)
@@ -238,15 +246,12 @@ func dumpSeries(cfg Config) error {
 		}
 
 		fmt.Fprintf(os.Stderr, "Reading time series data from %s (%d chunks)...\n", chunkFileName, len(fileChunks))
-		points, err := readChunkData(chunksReader, fileChunks, cfg, chunkFileName)
-		if err != nil {
+		if err := readChunkData(chunksReader, fileChunks, cfg, chunkFileName, writer); err != nil {
 			return fmt.Errorf("failed to read chunk data from %s: %w", chunkFileName, err)
 		}
-
-		allPoints = append(allPoints, points...)
 	}
 
-	fmt.Fprintf(os.Stderr, "Extracted %d data points from %d chunk files\n", len(allPoints), len(chunksByFile))
+	fmt.Fprintf(os.Stderr, "Processed %d chunk files\n", len(chunksByFile))
 
-	return outputResults(allPoints, cfg, bucket, tenant, blockID)
+	return nil
 }

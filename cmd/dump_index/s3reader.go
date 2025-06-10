@@ -276,8 +276,10 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 
 			for retry := 0; retry < maxRetries; retry++ {
 				rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
+
+				var reqErr error
 				var resp *s3.GetObjectOutput
-				r.client, resp, reqErr := getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
+				r.client, resp, reqErr = getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
 
 				if reqErr != nil {
 					err = reqErr

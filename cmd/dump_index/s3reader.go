@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/prometheus/tsdb/index"
 )
@@ -35,13 +36,14 @@ type OptimizedS3Reader struct {
 	localCacheDir  string
 	fileType       string
 	indexRanges    map[int64][]byte // For accumulating index ranges
+	awsProfile     string
 }
 
 func NewOptimizedS3Reader(client *s3.Client, bucket, key string, debug bool) (*OptimizedS3Reader, error) {
-	return NewOptimizedS3ReaderWithCache(client, bucket, key, debug, "", "")
+	return NewOptimizedS3ReaderWithCache(client, bucket, key, debug, "", "", "")
 }
 
-func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug bool, cacheDir, fileType string) (*OptimizedS3Reader, error) {
+func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug bool, cacheDir, fileType, awsProfile string) (*OptimizedS3Reader, error) {
 	var size int64
 
 	// If we're dealing with an index file and caching is enabled, check for a
@@ -72,15 +74,13 @@ func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug 
 				localCacheDir: cacheDir,
 				fileType:      fileType,
 				indexRanges:   make(map[int64][]byte),
+				awsProfile:    awsProfile,
 			}, nil
 		}
 	}
 
 	// No cached file found; fall back to S3 HEAD request to determine size
-	headResp, err := client.HeadObject(context.Background(), &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
+	client, headResp, err := headObjectWithRegionRetry(client, bucket, key, awsProfile, debug)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object info: %w", err)
 	}
@@ -97,6 +97,7 @@ func NewOptimizedS3ReaderWithCache(client *s3.Client, bucket, key string, debug 
 		localCacheDir: cacheDir,
 		fileType:      fileType,
 		indexRanges:   make(map[int64][]byte),
+		awsProfile:    awsProfile,
 	}, nil
 }
 
@@ -175,11 +176,7 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
 
-	resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(r.bucket),
-		Key:    aws.String(r.key),
-		Range:  aws.String(rangeHeader),
-	})
+	r.client, resp, err = getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read range %s: %w", rangeHeader, err)
 	}
@@ -280,11 +277,7 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 
 				rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
-				resp, reqErr := r.client.GetObject(ctx, &s3.GetObjectInput{
-					Bucket: aws.String(r.bucket),
-					Key:    aws.String(r.key),
-					Range:  aws.String(rangeHeader),
-				})
+				r.client, resp, reqErr := getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
 
 				if reqErr != nil {
 					cancel()
@@ -380,11 +373,8 @@ func (r *OptimizedS3Reader) downloadPiecesParallel(ctx context.Context, p []byte
 				if !found {
 					semaphore <- struct{}{}
 					rangeHeader := fmt.Sprintf("bytes=%d-%d", pc.start, pc.start+pc.length-1)
-					resp, err := r.client.GetObject(ctx, &s3.GetObjectInput{
-						Bucket: aws.String(r.bucket),
-						Key:    aws.String(r.key),
-						Range:  aws.String(rangeHeader),
-					})
+					var err error
+					r.client, resp, err := getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
 					if err != nil {
 						<-semaphore
 						errChan <- fmt.Errorf("failed to read range %s: %w", rangeHeader, err)
@@ -837,4 +827,100 @@ func (s *simpleByteSlice) Sub(start, end int) index.ByteSlice {
 		return nil
 	}
 	return &simpleByteSlice{data: s.data[start:end]}
+}
+
+// headObjectWithRegionRetry performs a HeadObject request and, if it receives a
+// 301 redirect error, automatically detects the bucket region and retries with
+// a new client. The potentially updated client is returned along with the
+// response.
+func headObjectWithRegionRetry(client *s3.Client, bucket, key, profile string, debug bool) (*s3.Client, *s3.HeadObjectOutput, error) {
+	ctx := context.Background()
+	headResp, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil || !strings.Contains(err.Error(), "301") {
+		return client, headResp, err
+	}
+
+	if debug {
+		fmt.Fprintf(os.Stderr, "Got 301 redirect for %s - attempting region detection...\n", key)
+	}
+
+	bucketRegion, regionErr := getBucketRegion(client, bucket, ctx)
+	if regionErr != nil {
+		return client, nil, fmt.Errorf("failed to get bucket region: %w", regionErr)
+	}
+
+	if debug {
+		fmt.Fprintf(os.Stderr, "Recreating client for region: %s\n", bucketRegion)
+	}
+
+	opts := []func(*config.LoadOptions) error{config.WithRegion(bucketRegion)}
+	if profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(profile))
+	}
+
+	newCfg, cfgErr := config.LoadDefaultConfig(context.Background(), opts...)
+	if cfgErr != nil {
+		return client, nil, fmt.Errorf("failed to load AWS config for correct region: %w", cfgErr)
+	}
+
+	client = s3.NewFromConfig(newCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
+
+	headResp, err = client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	return client, headResp, err
+}
+
+// getObjectWithRegionRetry performs a GetObject request with an optional Range
+// header and retries with the correct region if needed. The possibly updated
+// client is returned together with the response.
+func getObjectWithRegionRetry(client *s3.Client, bucket, key string, rangeHeader *string, profile string, debug bool) (*s3.Client, *s3.GetObjectOutput, error) {
+	ctx := context.Background()
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}
+	if rangeHeader != nil {
+		input.Range = rangeHeader
+	}
+	resp, err := client.GetObject(ctx, input)
+	if err == nil || !strings.Contains(err.Error(), "301") {
+		return client, resp, err
+	}
+
+	if debug {
+		fmt.Fprintf(os.Stderr, "Got 301 redirect for %s - attempting region detection...\n", key)
+	}
+
+	bucketRegion, regionErr := getBucketRegion(client, bucket, ctx)
+	if regionErr != nil {
+		return client, nil, fmt.Errorf("failed to get bucket region: %w", regionErr)
+	}
+
+	if debug {
+		fmt.Fprintf(os.Stderr, "Recreating client for region: %s\n", bucketRegion)
+	}
+
+	opts := []func(*config.LoadOptions) error{config.WithRegion(bucketRegion)}
+	if profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(profile))
+	}
+
+	newCfg, cfgErr := config.LoadDefaultConfig(context.Background(), opts...)
+	if cfgErr != nil {
+		return client, nil, fmt.Errorf("failed to load AWS config for correct region: %w", cfgErr)
+	}
+
+	client = s3.NewFromConfig(newCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
+
+	resp, err = client.GetObject(ctx, input)
+	return client, resp, err
 }

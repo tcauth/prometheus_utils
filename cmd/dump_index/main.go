@@ -9,11 +9,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"sync"
-	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/prometheus/tsdb/index"
@@ -111,7 +108,7 @@ func dumpSeries(cfg Config) error {
 			fmt.Fprintf(os.Stderr, "meta.json missing locally, downloading...\n")
 		}
 
-		s3Client, err := downloadMetaFile(s3Client, bucket, tenant, blockID, metaPath, cfg.AWSProfile, cfg.Debug)
+		s3Client, err = downloadMetaFile(s3Client, bucket, tenant, blockID, metaPath, cfg.AWSProfile, cfg.Debug)
 		if err == nil {
 			metaExists = true
 			if cfg.Debug {

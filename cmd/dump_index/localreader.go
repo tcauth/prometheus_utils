@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/prometheus/prometheus/tsdb/index"
 )
 
 // LocalPieceReader reads file data stored as pieces on disk.

@@ -176,6 +176,7 @@ func (r *OptimizedS3Reader) ReadAtWithContext(ctx context.Context, p []byte, off
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
 
+	var resp *s3.GetObjectOutput
 	r.client, resp, err = getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read range %s: %w", rangeHeader, err)
@@ -274,13 +275,11 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 			var err error
 
 			for retry := 0; retry < maxRetries; retry++ {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-
 				rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
+				var resp *s3.GetObjectOutput
 				r.client, resp, reqErr := getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
 
 				if reqErr != nil {
-					cancel()
 					err = reqErr
 					if retry < maxRetries-1 {
 						time.Sleep(time.Duration(retry+1) * time.Second)
@@ -292,7 +291,6 @@ func (r *OptimizedS3Reader) downloadParallel(chunkSize int64) error {
 
 				chunkData, err = io.ReadAll(resp.Body)
 				resp.Body.Close()
-				cancel()
 
 				if err == nil {
 					break
@@ -374,7 +372,8 @@ func (r *OptimizedS3Reader) downloadPiecesParallel(ctx context.Context, p []byte
 					semaphore <- struct{}{}
 					rangeHeader := fmt.Sprintf("bytes=%d-%d", pc.start, pc.start+pc.length-1)
 					var err error
-					r.client, resp, err := getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
+					var resp *s3.GetObjectOutput
+					r.client, resp, err = getObjectWithRegionRetry(r.client, r.bucket, r.key, aws.String(rangeHeader), r.awsProfile, r.debug)
 					if err != nil {
 						<-semaphore
 						errChan <- fmt.Errorf("failed to read range %s: %w", rangeHeader, err)

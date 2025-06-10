@@ -19,6 +19,15 @@ import (
 	"github.com/prometheus/prometheus/tsdb/index"
 )
 
+// DataReader abstracts the operations required by chunk and index readers.
+type DataReader interface {
+	io.ReaderAt
+	Len() int
+	Range(start, end int) []byte
+	Sub(start, end int) index.ByteSlice
+	Size() int64
+}
+
 func getChunkReferences(idx index.Reader, cfg Config) ([]ChunkInfo, error) {
 	var postings index.Postings
 	var err error
@@ -147,7 +156,7 @@ func outputChunkTable(chunkInfos []ChunkInfo, s3Client *s3.Client, bucket, tenan
 	return nil
 }
 
-func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg Config, chunkFileName string) ([]SeriesPoint, error) {
+func readChunkData(chunksReader DataReader, chunkInfos []ChunkInfo, cfg Config, chunkFileName string) ([]SeriesPoint, error) {
 	var allPoints []SeriesPoint
 	startTime := time.Now()
 
@@ -221,7 +230,7 @@ func readChunkData(chunksReader *OptimizedS3Reader, chunkInfos []ChunkInfo, cfg 
 	return allPoints, nil
 }
 
-func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResult, chunksReader *OptimizedS3Reader, cfg Config, chunkFileName string) {
+func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResult, chunksReader DataReader, cfg Config, chunkFileName string) {
 	for job := range jobs {
 		points, info, err := processOneChunk(job, chunksReader, cfg, workerID, chunkFileName)
 		results <- ChunkResult{
@@ -233,7 +242,7 @@ func processChunks(workerID int, jobs <-chan ChunkJob, results chan<- ChunkResul
 	}
 }
 
-func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, workerID int, chunkFileName string) ([]SeriesPoint, ChunkInfo, error) {
+func processOneChunk(job ChunkJob, chunksReader DataReader, cfg Config, workerID int, chunkFileName string) ([]SeriesPoint, ChunkInfo, error) {
 	info := job.ChunkInfo
 	chunkOffset := info.ChunkOffset
 
@@ -314,7 +323,7 @@ func processOneChunk(job ChunkJob, chunksReader *OptimizedS3Reader, cfg Config, 
 	return points, info, nil
 }
 
-func readRawChunk(r *OptimizedS3Reader, offset uint64) ([]byte, uint32, byte, error) {
+func readRawChunk(r DataReader, offset uint64) ([]byte, uint32, byte, error) {
 	header := make([]byte, chunks.MaxChunkLengthFieldSize+1)
 	if _, err := r.ReadAt(header, int64(offset)); err != nil && err != io.EOF {
 		return nil, 0, 0, err

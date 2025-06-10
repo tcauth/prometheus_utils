@@ -119,7 +119,7 @@ func outputChunkTable(chunkInfos []ChunkInfo, s3Client *s3.Client, bucket, tenan
 			chunkCacheDir = cfg.WorkingDir
 		}
 
-		reader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
+		reader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks", cfg.AWSProfile)
 		if err != nil {
 			return fmt.Errorf("failed to create chunks reader for file %06d: %w", fileNum, err)
 		}

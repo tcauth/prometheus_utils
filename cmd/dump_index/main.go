@@ -110,13 +110,17 @@ func dumpSeries(cfg Config) error {
 		if cfg.Debug {
 			fmt.Fprintf(os.Stderr, "meta.json missing locally, downloading...\n")
 		}
-		if err := downloadMetaFile(s3Client, bucket, tenant, blockID, metaPath); err == nil {
+
+		s3Client, err := downloadMetaFile(s3Client, bucket, tenant, blockID, metaPath, cfg.AWSProfile, cfg.Debug)
+		if err == nil {
 			metaExists = true
 			if cfg.Debug {
 				fmt.Fprintf(os.Stderr, "Cached meta.json to %s\n", metaPath)
 			}
 			return dumpSeriesLocal(cfg, localDir, bucket, tenant, blockID)
-		} else if cfg.Debug {
+		}
+
+		if cfg.Debug {
 			fmt.Fprintf(os.Stderr, "Failed to download meta.json: %v\n", err)
 		}
 	}
@@ -139,38 +143,9 @@ func dumpSeries(cfg Config) error {
 		indexCacheDir = cfg.WorkingDir
 	}
 
-	indexReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, indexKey, cfg.Debug, indexCacheDir, "index")
+	indexReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, indexKey, cfg.Debug, indexCacheDir, "index", cfg.AWSProfile)
 	if err != nil {
-		if strings.Contains(err.Error(), "301") {
-			fmt.Fprintf(os.Stderr, "Got 301 redirect - attempting region detection...\n")
-			ctx := context.Background()
-			bucketRegion, regionErr := getBucketRegion(s3Client, bucket, ctx)
-			if regionErr != nil {
-				return fmt.Errorf("failed to get bucket region: %w", regionErr)
-			}
-
-			fmt.Fprintf(os.Stderr, "Recreating client for region: %s\n", bucketRegion)
-			newConfigOpts := []func(*config.LoadOptions) error{config.WithRegion(bucketRegion)}
-			if cfg.AWSProfile != "" {
-				newConfigOpts = append(newConfigOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
-			}
-
-			newAwsCfg, err := config.LoadDefaultConfig(context.Background(), newConfigOpts...)
-			if err != nil {
-				return fmt.Errorf("failed to load AWS config for correct region: %w", err)
-			}
-
-			s3Client = s3.NewFromConfig(newAwsCfg, func(o *s3.Options) {
-				o.UsePathStyle = true
-			})
-
-			indexReader, err = NewOptimizedS3ReaderWithCache(s3Client, bucket, indexKey, cfg.Debug, indexCacheDir, "index")
-			if err != nil {
-				return fmt.Errorf("failed to create index reader with correct region: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to create index reader: %w", err)
-		}
+		return fmt.Errorf("failed to create index reader: %w", err)
 	}
 
 	if cfg.ForceIndexParallel {
@@ -255,42 +230,10 @@ func dumpSeries(cfg Config) error {
 					chunkCacheDir = cfg.WorkingDir
 				}
 
-				chunksReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
+				chunksReader, err := NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks", cfg.AWSProfile)
 				if err != nil {
-					if strings.Contains(err.Error(), "301") {
-						fmt.Fprintf(os.Stderr, "Got 301 redirect for chunk file - attempting region detection...\n")
-						ctx := context.Background()
-						bucketRegion, regionErr := getBucketRegion(s3Client, bucket, ctx)
-						if regionErr != nil {
-							errCh <- fmt.Errorf("failed to get bucket region: %w", regionErr)
-							continue
-						}
-
-						fmt.Fprintf(os.Stderr, "Recreating client for region: %s\n", bucketRegion)
-						newConfigOpts := []func(*config.LoadOptions) error{config.WithRegion(bucketRegion)}
-						if cfg.AWSProfile != "" {
-							newConfigOpts = append(newConfigOpts, config.WithSharedConfigProfile(cfg.AWSProfile))
-						}
-
-						newAwsCfg, err := config.LoadDefaultConfig(context.Background(), newConfigOpts...)
-						if err != nil {
-							errCh <- fmt.Errorf("failed to load AWS config for correct region: %w", err)
-							continue
-						}
-
-						s3Client = s3.NewFromConfig(newAwsCfg, func(o *s3.Options) {
-							o.UsePathStyle = true
-						})
-
-						chunksReader, err = NewOptimizedS3ReaderWithCache(s3Client, bucket, chunksKey, cfg.Debug, chunkCacheDir, "chunks")
-						if err != nil {
-							errCh <- fmt.Errorf("failed to create chunks reader with correct region for file %06d: %w", job.fileNum, err)
-							continue
-						}
-					} else {
-						errCh <- fmt.Errorf("failed to create chunks reader for file %06d: %w", job.fileNum, err)
-						continue
-					}
+					errCh <- fmt.Errorf("failed to create chunks reader for file %06d: %w", job.fileNum, err)
+					continue
 				}
 
 				fmt.Fprintf(os.Stderr, "Reading time series data from %s (%d chunks)...\n", chunkFileName, len(job.fileChunks))
@@ -332,28 +275,26 @@ func dumpSeries(cfg Config) error {
 	return outputResults(allPoints, cfg, bucket, tenant, blockID)
 }
 
-func downloadMetaFile(s3Client *s3.Client, bucket, tenant, blockID, destPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
+func downloadMetaFile(s3Client *s3.Client, bucket, tenant, blockID, destPath, awsProfile string, debug bool) (*s3.Client, error) {
 	key := path.Join(tenant, blockID, "meta.json")
-	resp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
+
+	var resp *s3.GetObjectOutput
+	var err error
+	s3Client, resp, err = getObjectWithRegionRetry(s3Client, bucket, key, nil, awsProfile, debug)
 	if err != nil {
-		return err
+		return s3Client, err
 	}
 	defer resp.Body.Close()
 
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return err
+		return s3Client, err
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return s3Client, err
 	}
 
-	return os.WriteFile(destPath, data, 0644)
+	err = os.WriteFile(destPath, data, 0644)
+	return s3Client, err
 }

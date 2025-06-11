@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -71,45 +72,62 @@ func outputCSV(w io.Writer, points []SeriesPoint, cfg Config) error {
 	writer := csv.NewWriter(w)
 	defer writer.Flush()
 
-	if cfg.OutputLabels == "" {
-		if err := writer.Write([]string{"series_labels", "timestamp", "value"}); err != nil {
-			return fmt.Errorf("failed to write CSV header: %w", err)
-		}
-
-		for _, point := range points {
-			record := []string{
-				point.SeriesLabels,
-				strconv.FormatInt(point.Timestamp, 10),
-				strconv.FormatFloat(point.Value, 'f', -1, 64),
+	// Determine which label columns to output
+	labelNames := []string{}
+	if cfg.OutputLabels != "" {
+		labelNames = append(labelNames, "__name__")
+		for _, l := range strings.Split(cfg.OutputLabels, ",") {
+			name := strings.TrimSpace(l)
+			if name == "" || name == "__name__" {
+				continue
 			}
-			if err := writer.Write(record); err != nil {
-				return fmt.Errorf("failed to write CSV record: %w", err)
-			}
+			labelNames = append(labelNames, name)
 		}
-		return nil
 	}
 
-	labelNames := []string{"__name__"}
-	for _, l := range strings.Split(cfg.OutputLabels, ",") {
-		name := strings.TrimSpace(l)
-		if name == "" || name == "__name__" {
-			continue
-		}
-		labelNames = append(labelNames, name)
+	// Build CSV header
+	header := []string{}
+	if cfg.LabelsJSON {
+		header = append(header, "labels")
 	}
+	if len(labelNames) > 0 {
+		header = append(header, labelNames...)
+	}
+	if len(header) == 0 { // default case with no custom labels
+		header = append(header, "series_labels")
+	}
+	header = append(header, "timestamp", "value")
 
-	header := append(labelNames, "timestamp", "value")
 	if err := writer.Write(header); err != nil {
 		return fmt.Errorf("failed to write CSV header: %w", err)
 	}
 
 	for _, point := range points {
-		record := make([]string, len(labelNames)+2)
-		for i, name := range labelNames {
-			record[i] = point.Labels.Get(name)
+		record := []string{}
+
+		if cfg.LabelsJSON {
+			b, err := json.Marshal(point.Labels.Map())
+			if err != nil {
+				return fmt.Errorf("failed to marshal labels to JSON: %w", err)
+			}
+			record = append(record, string(b))
 		}
-		record[len(labelNames)] = strconv.FormatInt(point.Timestamp, 10)
-		record[len(labelNames)+1] = strconv.FormatFloat(point.Value, 'f', -1, 64)
+
+		if len(labelNames) > 0 {
+			for _, name := range labelNames {
+				record = append(record, point.Labels.Get(name))
+			}
+		} else {
+			if !cfg.LabelsJSON {
+				record = append(record, point.SeriesLabels)
+			}
+		}
+
+		record = append(record,
+			strconv.FormatInt(point.Timestamp, 10),
+			strconv.FormatFloat(point.Value, 'f', -1, 64),
+		)
+
 		if err := writer.Write(record); err != nil {
 			return fmt.Errorf("failed to write CSV record: %w", err)
 		}

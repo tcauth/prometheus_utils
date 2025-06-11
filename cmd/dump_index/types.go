@@ -25,6 +25,7 @@ type Config struct {
 	DumpChunkTable     bool
 	OutputFilename     string
 	OutputLabels       string
+	LabelsJSON         bool
 }
 
 type SeriesPoint struct {

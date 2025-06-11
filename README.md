@@ -22,3 +22,5 @@ go build ./cmd/dump_index
 By default the results are written under `<working-dir>/<bucket>/<tenant>/<block>/<metric-name>/<output-filename>.<ext>`. Use `-ouput-filename` to set the file name explicitly. If not provided a random 4 digit number is used.
 
 Use `-chunk-file-workers` to control how many chunk files are processed in parallel. The existing `-chunk-workers` flag controls parallelism within each file.
+
+Use `--output-labels` to add specific labels as columns in the CSV output. When `--labels-json` is set, an additional `labels` column containing all labels encoded as JSON is included (CSV only).

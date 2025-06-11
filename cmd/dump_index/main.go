@@ -37,6 +37,7 @@ func main() {
 	flag.StringVar(&cfg.OutputFormat, "output", "csv", "Output format: csv, json, or prometheus")
 	flag.StringVar(&cfg.OutputFilename, "ouput-filename", "", "Output filename (default random 4 digits)")
 	flag.StringVar(&cfg.OutputLabels, "output-labels", "", "Comma separated list of labels to output as columns (CSV only)")
+	flag.BoolVar(&cfg.LabelsJSON, "labels-json", false, "Include a 'labels' column with all labels as JSON (CSV only)")
 	flag.BoolVar(&cfg.DumpChunkTable, "dump-chunk-table", false, "Dump chunk table (chunk file, offset, size) as CSV instead of time series data")
 	flag.Parse()
 
